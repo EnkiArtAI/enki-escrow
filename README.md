@@ -17,4 +17,18 @@ The specification is [ClickUp 123qmzqzw1w](https://app.clickup.com/t/9015834867/
 
 Tests use an in-process Solana VM and disposable wallets. They require no Enki secrets, live RPC connection or paid generation API.
 
+## Build and test
+
+The program branch pins Anchor 0.32.1, host Rust 1.90.0, Agave 2.3.0 and SBF platform-tools v1.57. CI runs on Ubuntu 24.04 and verifies the tool archives' SHA-256 before extraction.
+
+With that toolchain configured:
+
+```sh
+cargo fmt --all -- --check
+cargo build-sbf --tools-version v1.57 -- --locked
+cargo test --workspace --locked -- --test-threads=1
+```
+
+The VM tests require `target/deploy/enki_escrow.so` and fail when it is absent. The default build accepts devnet USDC. A mainnet build requires `--no-default-features --features mainnet` and a separate release review. The program address in the draft is a test address, not evidence of a deployment.
+
 See [CONTRIBUTING.md](CONTRIBUTING.md) for review and release rules. Licensed under [Apache-2.0](LICENSE).
