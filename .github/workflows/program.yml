@@ -53,6 +53,20 @@ jobs:
         run: |
           python3 scripts/check-mutations.py
           git diff --exit-code -- programs/enki-escrow/src/lib.rs
+      - name: Build the Anchor interface from Rust
+        env:
+          RUSTUP_TOOLCHAIN: 1.90.0
+        run: |
+          mkdir -p target/idl
+          .ci-tools/anchor idl build --program-name enki_escrow --out target/idl/enki_escrow.json -- --locked --lib
+          git rev-parse HEAD > target/idl/program-source-commit.txt
+          sha256sum target/idl/enki_escrow.json > target/idl/idl.sha256
+      - name: Export the verified program interface
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: enki-escrow-idl
+          path: target/idl/
+          if-no-files-found: error
       - name: Save completed builds for subsequent checks
         if: always() && steps.sbf-build.outcome == 'success' && steps.build-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
