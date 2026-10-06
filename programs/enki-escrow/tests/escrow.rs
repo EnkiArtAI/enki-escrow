@@ -422,7 +422,7 @@ enum Role {
 }
 
 fn rejects(result: TransactionResult, code: u32) {
-    use anchor_lang::solana_program::instruction::InstructionError;
+    use anchor_lang::prelude::instruction::error::InstructionError;
     use solana_transaction_error::TransactionError;
     let error = result.unwrap_err();
     assert_eq!(
