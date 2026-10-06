@@ -2,6 +2,13 @@
 members = ["programs/enki-escrow"]
 resolver = "2"
 
+# Optimize the host VM and signature checks for the 100000-sequence suite.
+# Keep arithmetic and debug assertions enabled; the SBF release profile is separate.
+[profile.test]
+opt-level = 1
+debug-assertions = true
+overflow-checks = true
+
 [profile.release]
 overflow-checks = true
 lto = "fat"

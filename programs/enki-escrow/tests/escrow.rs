@@ -215,6 +215,18 @@ impl Fixture {
         )
     }
 
+    fn send_as_stranger(&mut self, ix: Instruction) -> TransactionResult {
+        self.svm.expire_blockhash();
+        let msg = Message::new_with_blockhash(
+            &[ix],
+            Some(&self.stranger.pubkey()),
+            &self.svm.latest_blockhash(),
+        );
+        let tx = VersionedTransaction::try_new(VersionedMessage::Legacy(msg), &[&self.stranger])
+            .unwrap();
+        self.svm.send_transaction(tx)
+    }
+
     fn deposit_ix(
         &self,
         intent_id: [u8; 16],
@@ -632,12 +644,21 @@ fn expiry_refunds_funded_escrow_and_any_caller_can_reclaim() {
     f.init();
     let id = [6; 16];
     f.deposit(id, 1, [900_000, 100_000]);
+    let ix = f.reclaim_ix(id, f.payer.pubkey(), false);
     rejects(
-        f.reclaim(id),
+        f.send_as_stranger(ix),
         code(enki_escrow::EscrowError::NotReclaimable),
     );
     f.clock(NOW + 900);
-    f.reclaim(id).unwrap();
+    let (escrow, vault) = f.pdas(id);
+    let rent = f.svm.get_balance(&escrow).unwrap() + f.svm.get_balance(&vault).unwrap();
+    let payer_before = f.svm.get_balance(&f.payer.pubkey()).unwrap();
+    let ix = f.reclaim_ix(id, f.payer.pubkey(), false);
+    f.send_as_stranger(ix).unwrap();
+    assert_eq!(
+        f.svm.get_balance(&f.payer.pubkey()).unwrap(),
+        payer_before + rent
+    );
     assert_eq!(f.tokens(f.buyer_ata), BUYER_TOKENS);
     assert_eq!(f.tokens(f.treasury_ata), 0);
     assert_eq!(f.tokens(f.artist_ata), 0);
@@ -664,7 +685,12 @@ fn missing_buyer_ata_fee_rules_are_exact_and_rent_destination_cannot_change() {
             assert_eq!(f.tokens(f.treasury_ata), 1_000_000);
             assert_eq!(f.svm.get_account(&f.buyer_ata).unwrap().owner, token::ID);
         } else {
-            f.reclaim(id).unwrap();
+            if remaining == 0 {
+                let ix = f.reclaim_ix(id, f.payer.pubkey(), false);
+                f.send_as_stranger(ix).unwrap();
+            } else {
+                f.reclaim(id).unwrap();
+            }
             assert!(f
                 .svm
                 .get_account(&f.buyer_ata)
@@ -684,12 +710,8 @@ fn missing_buyer_ata_requires_stored_rent_payer_signature() {
     f.remove_ata(f.buyer_ata);
     // Use a different transaction fee payer so the stored rent payer does not sign implicitly.
     let ix = f.reclaim_ix(id, f.payer.pubkey(), false);
-    f.svm.expire_blockhash();
-    let msg =
-        Message::new_with_blockhash(&[ix], Some(&f.stranger.pubkey()), &f.svm.latest_blockhash());
-    let tx = VersionedTransaction::try_new(VersionedMessage::Legacy(msg), &[&f.stranger]).unwrap();
     rejects(
-        f.svm.send_transaction(tx),
+        f.send_as_stranger(ix),
         code(enki_escrow::EscrowError::RentPayerMustSign),
     );
     assert_eq!(f.tokens(f.pdas(id).1), 1_500_000);
@@ -807,5 +829,8 @@ fn randomized_100000_program_sequences_conserve_tokens_and_never_pay_twice() {
             treasury_paid + artist_paid,
             "case {iteration}"
         );
+        if (iteration + 1) % 10_000 == 0 {
+            println!("Validated {} of 100000 escrow sequences", iteration + 1);
+        }
     }
 }

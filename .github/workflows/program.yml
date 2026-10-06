@@ -25,7 +25,8 @@ jobs:
         run: rustup toolchain install 1.90.0 --profile minimal --component rustfmt
       - name: Select host Rust
         run: rustup override set 1.90.0
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        id: build-cache
         with:
           path: |
             ~/.cargo/registry
@@ -33,16 +34,33 @@ jobs:
             target/debug
             target/sbpf-solana-solana
             .ci-tools/archives
-          key: escrow-${{ runner.os }}-rust1.90-agave2.3-tools1.57-${{ hashFiles('Cargo.lock', 'scripts/install-ci-tools.sh') }}
+          key: escrow-${{ runner.os }}-rust1.90-agave2.3-tools1.57-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'scripts/install-ci-tools.sh') }}
+          restore-keys: escrow-${{ runner.os }}-rust1.90-agave2.3-tools1.57-
       - name: Format check
         run: cargo fmt --all -- --check
       - name: Install checksum-verified SBF tools
         run: bash scripts/install-ci-tools.sh
       - name: Build devnet SBF program
+        id: sbf-build
         run: |
           export PATH="$PWD/.ci-tools/platform-tools/rust/bin:$PWD/.ci-tools/solana-release/bin:$PATH"
           export RUSTC="$PWD/.ci-tools/platform-tools/rust/bin/rustc"
           cargo build-sbf --skip-tools-install --no-rustup-override --jobs 2 --sbf-out-dir target/deploy -- --locked
           test -s target/deploy/enki_escrow.so
       - name: Unit and LiteSVM tests, including 100000 program sequences
-        run: cargo test --workspace --locked -- --test-threads=1
+        run: cargo test --workspace --locked -- --nocapture --test-threads=1
+      - name: Prove settlement and refund regressions fail
+        run: |
+          python3 scripts/check-mutations.py
+          git diff --exit-code -- programs/enki-escrow/src/lib.rs
+      - name: Save completed builds for subsequent checks
+        if: always() && steps.sbf-build.outcome == 'success' && steps.build-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/debug
+            target/sbpf-solana-solana
+            .ci-tools/archives
+          key: ${{ steps.build-cache.outputs.cache-primary-key }}

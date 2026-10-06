@@ -31,4 +31,8 @@ cargo test --workspace --locked -- --test-threads=1
 
 The VM tests require `target/deploy/enki_escrow.so` and fail when it is absent. The default build accepts devnet USDC. A mainnet build requires `--no-default-features --features mainnet` and a separate release review. The program address in the draft is a test address, not evidence of a deployment.
 
+The host VM tests use optimization level 1 with overflow checks and debug assertions enabled. The 100,000-sequence test reports progress every 10,000 sequences in CI.
+
+After the original program passes, Linux CI compiles three deliberately faulty programs and requires the matching VM tests to fail: allowing repeated settlement, charging for undelivered units, and refunding without deducting the missing-ATA fee. `scripts/check-mutations.py` restores the original source and SBF binary in a `finally` block. A compilation failure does not count as mutation proof.
+
 See [CONTRIBUTING.md](CONTRIBUTING.md) for review and release rules. Licensed under [Apache-2.0](LICENSE).
