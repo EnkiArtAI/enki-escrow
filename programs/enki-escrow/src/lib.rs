@@ -18,7 +18,6 @@ pub const USDC_MINT: Pubkey = pubkey!("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTD
 pub const USDC_MINT: Pubkey = pubkey!("4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU");
 
 pub const MAX_UNITS: u8 = 24;
-pub const MAX_DEPOSIT_MICRO: u64 = 25_000_000;
 pub const MIN_TTL_S: i64 = 600;
 pub const MAX_TTL_S: i64 = 1_800;
 pub const MAX_REFUND_ATA_FEE_MICRO: u64 = 1_000_000;
@@ -285,10 +284,7 @@ impl ConfigArgs {
             self.treasury_owner != Pubkey::default(),
             EscrowError::InvalidRole
         );
-        require!(
-            self.max_deposit_micro > 0 && self.max_deposit_micro <= MAX_DEPOSIT_MICRO,
-            EscrowError::DepositCap
-        );
+        require!(self.max_deposit_micro > 0, EscrowError::DepositCap);
         require!(
             self.min_ttl_s >= MIN_TTL_S
                 && self.max_ttl_s <= MAX_TTL_S
@@ -485,10 +481,7 @@ fn deposit_amount(units: u8, amounts: [u64; 2], cap: u64) -> Result<u64> {
         .ok_or(EscrowError::Overflow)?;
     require!(per_unit > 0, EscrowError::ZeroAmount);
     let total = checked_product(units, per_unit)?;
-    require!(
-        total <= cap && total <= MAX_DEPOSIT_MICRO,
-        EscrowError::DepositCap
-    );
+    require!(total <= cap, EscrowError::DepositCap);
     Ok(total)
 }
 
@@ -659,14 +652,23 @@ mod tests {
 
     #[test]
     fn deposits_reject_empty_oversized_zero_and_overflowing_amounts() {
-        assert!(deposit_amount(0, [1, 0], MAX_DEPOSIT_MICRO).is_err());
-        assert!(deposit_amount(25, [1, 0], MAX_DEPOSIT_MICRO).is_err());
-        assert!(deposit_amount(1, [0, 0], MAX_DEPOSIT_MICRO).is_err());
-        assert!(deposit_amount(1, [u64::MAX, 1], MAX_DEPOSIT_MICRO).is_err());
+        let config_cap = 50_000_000;
+        assert!(deposit_amount(0, [1, 0], config_cap).is_err());
+        assert!(deposit_amount(25, [1, 0], config_cap).is_err());
+        assert!(deposit_amount(1, [0, 0], config_cap).is_err());
+        assert!(deposit_amount(1, [u64::MAX, 1], config_cap).is_err());
         assert!(deposit_amount(24, [u64::MAX / 2, 0], u64::MAX).is_err());
-        assert!(deposit_amount(1, [MAX_DEPOSIT_MICRO + 1, 0], u64::MAX).is_err());
+        assert!(deposit_amount(1, [config_cap + 1, 0], config_cap).is_err());
         assert_eq!(
-            deposit_amount(24, [900_000, 100_000], MAX_DEPOSIT_MICRO).unwrap(),
+            deposit_amount(1, [60_000_000, 0], 60_000_000).unwrap(),
+            60_000_000
+        );
+        assert_eq!(
+            deposit_amount(4, [12_500_000, 0], config_cap).unwrap(),
+            config_cap
+        );
+        assert_eq!(
+            deposit_amount(24, [900_000, 100_000], config_cap).unwrap(),
             24_000_000
         );
     }

@@ -9,7 +9,10 @@ The specification is [ClickUp 123qmzqzw1w](https://app.clickup.com/t/9015834867/
 ## Payment contract
 
 - Classic SPL USDC only, with a cluster-specific mint and six decimals.
-- A deposit holds 1–24 units, capped at 25 USDC across the batch.
+- A deposit holds 1–24 units. The sole batch cap is `Config.max_deposit_micro`
+  (the 2026-10-06 specification calls for 50 USDC when Config is initialized).
+  It can be changed by the admin without redeploying code. Clients and SQL must
+  read this on-chain field instead of defining another policy limit.
 - The treasury and optional artist amounts per unit are fixed by the deposit.
 - The authorized operator settles once for `k` delivered units, with `0 <= k <= N`.
 - Any caller can reclaim after settlement or expiry; refunds and account rent go to the stored destinations.

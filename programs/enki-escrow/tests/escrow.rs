@@ -152,7 +152,7 @@ impl Fixture {
             operator: self.operator.pubkey(),
             treasury_owner: self.treasury,
             paused: false,
-            max_deposit_micro: 25_000_000,
+            max_deposit_micro: 50_000_000,
             min_ttl_s: 600,
             max_ttl_s: 1_800,
             refund_ata_fee_micro: 1_000_000,
@@ -514,7 +514,7 @@ fn deposit_rejects_invalid_numbers_ttl_treasury_mint_and_noncanonical_source() {
         (0, [1, 0], NOW + 900, E::InvalidUnits),
         (25, [1, 0], NOW + 900, E::InvalidUnits),
         (1, [0, 0], NOW + 900, E::ZeroAmount),
-        (1, [25_000_001, 0], NOW + 900, E::DepositCap),
+        (1, [50_000_001, 0], NOW + 900, E::DepositCap),
         (1, [u64::MAX, 1], NOW + 900, E::Overflow),
         (24, [u64::MAX / 2, 0], NOW + 900, E::Overflow),
         (1, [1, 0], NOW + 599, E::InvalidTtl),
@@ -777,13 +777,13 @@ fn guardian_can_only_pause_or_revoke_admin_restores_and_paused_refunds_work() {
 }
 
 #[test]
-fn config_cannot_exceed_hard_deposit_ttl_or_refund_fee_limits() {
+fn config_rejects_zero_cap_and_invalid_ttl_or_refund_fee_limits() {
     let mut f = Fixture::new();
     f.init();
     for kind in 0..4 {
         let mut args = f.args();
         match kind {
-            0 => args.max_deposit_micro = 25_000_001,
+            0 => args.max_deposit_micro = 0,
             1 => args.refund_ata_fee_micro = 1_000_001,
             2 => args.min_ttl_s = 599,
             _ => args.max_ttl_s = 1_801,
@@ -795,16 +795,55 @@ fn config_cannot_exceed_hard_deposit_ttl_or_refund_fee_limits() {
 }
 
 #[test]
+fn config_alone_controls_new_deposits_and_lowering_it_does_not_block_refunds() {
+    let mut f = Fixture::new();
+    f.init();
+    let original = [12; 16];
+    f.deposit(original, 4, [12_500_000, 0]);
+    rejects(
+        f.send(
+            f.deposit_ix([13; 16], 1, [60_000_000, 0], NOW + 900),
+            &[Role::Buyer],
+        ),
+        code(enki_escrow::EscrowError::DepositCap),
+    );
+    let mut args = f.args();
+    args.max_deposit_micro = 60_000_000;
+    f.send(f.update_ix(f.admin.pubkey(), args), &[Role::Admin])
+        .unwrap();
+    f.deposit([13; 16], 1, [60_000_000, 0]);
+    let mut args = f.args();
+    args.max_deposit_micro = 5_000_000;
+    f.send(f.update_ix(f.admin.pubkey(), args), &[Role::Admin])
+        .unwrap();
+    rejects(
+        f.send(
+            f.deposit_ix([14; 16], 1, [5_000_001, 0], NOW + 900),
+            &[Role::Buyer],
+        ),
+        code(enki_escrow::EscrowError::DepositCap),
+    );
+    f.settle(original, 2).unwrap();
+    f.reclaim(original).unwrap();
+    f.settle([13; 16], 0).unwrap();
+    f.reclaim([13; 16]).unwrap();
+    assert_eq!(f.tokens(f.buyer_ata), BUYER_TOKENS - 25_000_000);
+}
+
+#[test]
 fn randomized_100000_program_sequences_conserve_tokens_and_never_pay_twice() {
     let mut f = Fixture::new();
     f.init();
+    let cap = Config::try_deserialize(&mut f.svm.get_account(&f.config).unwrap().data.as_slice())
+        .unwrap()
+        .max_deposit_micro;
     let mut random = 0x1234_5678_9abc_def0_u64;
     for iteration in 0_u64..100_000 {
         random ^= random << 13;
         random ^= random >> 7;
         random ^= random << 17;
         let units = (random % 24 + 1) as u8;
-        let per_unit = random.rotate_left(17) % (25_000_000 / u64::from(units)) + 1;
+        let per_unit = random.rotate_left(17) % (cap / u64::from(units)) + 1;
         let artist = random.rotate_left(29) % per_unit;
         let amounts = [per_unit - artist, artist];
         let mut id = [0_u8; 16];

@@ -14,6 +14,12 @@ BINARY = ROOT / "target/deploy/enki_escrow.so"
 PARTIAL = "partial_delivery_pays_exact_units_refunds_rest_and_returns_rent"
 MUTATIONS = (
     (
+        "restore-second-deposit-cap",
+        b"total <= cap, EscrowError::DepositCap",
+        b"total <= cap && total <= 25_000_000, EscrowError::DepositCap",
+        "config_alone_controls_new_deposits_and_lowering_it_does_not_block_refunds",
+    ),
+    (
         "repeat-settlement",
         b"escrow.state == EscrowState::Funded",
         b"true",
@@ -101,7 +107,7 @@ def main():
         BINARY.write_bytes(original_binary)
     if SOURCE.read_bytes() != original_source or BINARY.read_bytes() != original_binary:
         raise RuntimeError("Original source and SBF binary were not restored")
-    print("Mutation checks: 3/3; original source and SBF binary restored.")
+    print(f"Mutation checks: {len(MUTATIONS)}/{len(MUTATIONS)}; original source and SBF binary restored.")
 
 
 if __name__ == "__main__":
