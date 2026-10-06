@@ -19,7 +19,7 @@ Tests use an in-process Solana VM and disposable wallets. They require no Enki s
 
 ## Build and test
 
-The program branch pins Anchor 0.32.1, host Rust 1.90.0, Agave 2.3.0 and SBF platform-tools v1.57. CI runs on Ubuntu 24.04 and verifies the tool archives' SHA-256 before extraction.
+The program branch pins Anchor 0.32.1, host Rust 1.90.0, Agave 2.3.0 and SBF platform-tools v1.57. CI uses GitHub's standard `ubuntu-latest` x64 runner and verifies the tool archives' SHA-256 before extraction.
 
 With that toolchain configured:
 
