@@ -36,7 +36,7 @@ The VM tests require `target/deploy/enki_escrow.so` and fail when it is absent. 
 
 The host VM tests use optimization level 1 with overflow checks and debug assertions enabled. The 100,000-sequence test reports progress every 10,000 sequences in CI.
 
-After the original program passes, Linux CI compiles three deliberately faulty programs and requires the matching VM tests to fail: allowing repeated settlement, charging for undelivered units, and refunding without deducting the missing-ATA fee. `scripts/check-mutations.py` restores the original source and SBF binary in a `finally` block. A compilation failure does not count as mutation proof.
+After the original program passes, Linux CI compiles four deliberately faulty programs and requires the matching VM tests to fail: restoring a second fixed deposit cap, allowing repeated settlement, charging for undelivered units, and refunding without deducting the missing-ATA fee. `scripts/check-mutations.py` restores the original source and SBF binary in a `finally` block. A compilation failure does not count as mutation proof.
 
 CI also exports the Anchor IDL compiled from the Rust source as `enki-escrow-idl`, with its SHA-256 and source commit. The server client must be generated from this artifact. The pinned Anchor 0.32.1 CLI is checksum-verified and `anchor idl build` runs without a wallet or RPC connection.
 
