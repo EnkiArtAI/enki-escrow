@@ -57,8 +57,11 @@ jobs:
         env:
           RUSTUP_TOOLCHAIN: 1.90.0
         run: |
+          export PATH="$PWD/.ci-tools:$PWD/.ci-tools/solana-release/bin:$PATH"
+          anchor --version
+          solana --version
           mkdir -p target/idl
-          .ci-tools/anchor idl build --program-name enki_escrow --out target/idl/enki_escrow.json -- --locked --lib
+          anchor idl build --program-name enki_escrow --out target/idl/enki_escrow.json -- --locked --lib
           git rev-parse HEAD > target/idl/program-source-commit.txt
           sha256sum target/idl/enki_escrow.json > target/idl/idl.sha256
       - name: Export the verified program interface
