@@ -134,11 +134,14 @@ pub mod enki_escrow {
         let artist_available = if artist_due == 0 {
             false
         } else {
+            // The account constraint enforces its address; unusable contents forfeit this leg.
             canonical_token_status(
                 &ctx.accounts.artist_ata.to_account_info(),
                 escrow.recipient_owners[1],
                 escrow.mint,
-            )? == TokenStatus::Ready
+            )
+            .unwrap_or(TokenStatus::Frozen)
+                == TokenStatus::Ready
         };
         let artist_paid = if artist_available { artist_due } else { 0 };
         let paid = treasury_paid
@@ -191,16 +194,20 @@ pub mod enki_escrow {
             EscrowError::NotReclaimable
         );
         let remaining = ctx.accounts.vault.amount;
-        let buyer_status = canonical_token_status(
-            &ctx.accounts.buyer_ata.to_account_info(),
-            escrow.buyer,
-            escrow.mint,
-        )?;
-        require!(
-            remaining == 0 || buyer_status != TokenStatus::Frozen,
-            EscrowError::FrozenBuyerAta
-        );
-        let missing = buyer_status == TokenStatus::Missing;
+        let missing = if remaining > 0 {
+            let buyer_status = canonical_token_status(
+                &ctx.accounts.buyer_ata.to_account_info(),
+                escrow.buyer,
+                escrow.mint,
+            )?;
+            require!(
+                buyer_status != TokenStatus::Frozen,
+                EscrowError::FrozenBuyerAta
+            );
+            buyer_status == TokenStatus::Missing
+        } else {
+            false
+        };
         if remaining > 0 && missing {
             require!(
                 ctx.accounts.rent_payer.is_signer,
@@ -391,7 +398,7 @@ pub struct Deposit<'info> {
     #[account(seeds = [b"config"], bump = config.bump)]
     pub config: Account<'info, Config>,
     pub buyer: Signer<'info>,
-    #[account(mut)]
+    #[account(mut, address = config.operator @ EscrowError::Unauthorized)]
     pub rent_payer: Signer<'info>,
     #[account(address = USDC_MINT @ EscrowError::WrongMint, mint::decimals = USDC_DECIMALS)]
     pub mint: Account<'info, Mint>,

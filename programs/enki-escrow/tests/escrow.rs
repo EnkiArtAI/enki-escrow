@@ -49,7 +49,8 @@ impl Fixture {
         let admin = Keypair::new();
         let guardian = Keypair::new();
         let operator = Keypair::new();
-        let payer = Keypair::new();
+        // The configured quote signer also sponsors rent; this is a disposable test key.
+        let payer = operator.insecure_clone();
         let buyer = Keypair::new();
         let stranger = Keypair::new();
         for key in [&admin, &guardian, &operator, &payer, &buyer, &stranger] {
@@ -395,6 +396,28 @@ impl Fixture {
         self.svm.set_account(ata, Account::default()).unwrap();
     }
 
+    fn change_ata(&mut self, ata: Pubkey, change: AtaChange) {
+        let mut account = self.svm.get_account(&ata).unwrap();
+        match change {
+            AtaChange::WrongProgram => account.owner = anchor_lang::system_program::ID,
+            AtaChange::Malformed => account.data.truncate(7),
+            _ => {
+                let mut token = spl_token::state::Account::unpack(&account.data).unwrap();
+                match change {
+                    AtaChange::ReassignedOwner => token.owner = self.stranger.pubkey(),
+                    AtaChange::WrongMint => token.mint = self.stranger.pubkey(),
+                    AtaChange::Uninitialized => {
+                        token.state = spl_token::state::AccountState::Uninitialized
+                    }
+                    AtaChange::Frozen => token.state = spl_token::state::AccountState::Frozen,
+                    _ => unreachable!(),
+                }
+                spl_token::state::Account::pack(token, &mut account.data).unwrap();
+            }
+        }
+        self.svm.set_account(ata, account).unwrap();
+    }
+
     fn emergency(&self, authority: Pubkey, revoke: bool) -> Instruction {
         Instruction {
             program_id: ID,
@@ -432,6 +455,25 @@ enum Role {
     Buyer,
     Stranger,
 }
+
+#[derive(Clone, Copy, Debug)]
+enum AtaChange {
+    ReassignedOwner,
+    WrongMint,
+    WrongProgram,
+    Malformed,
+    Uninitialized,
+    Frozen,
+}
+
+const UNUSABLE_ATAS: [AtaChange; 6] = [
+    AtaChange::ReassignedOwner,
+    AtaChange::WrongMint,
+    AtaChange::WrongProgram,
+    AtaChange::Malformed,
+    AtaChange::Uninitialized,
+    AtaChange::Frozen,
+];
 
 fn rejects(result: TransactionResult, code: u32) {
     use anchor_lang::prelude::instruction::error::InstructionError;
@@ -575,9 +617,15 @@ fn source_delegate_or_missing_buyer_signature_cannot_deposit() {
         f.send(f.deposit_ix([3; 16], 1, [1, 0], NOW + 900), &[Role::Buyer]),
         code(enki_escrow::EscrowError::DelegatedSource),
     );
+    f.set_tokens(
+        f.buyer_ata,
+        f.buyer.pubkey(),
+        BUYER_TOKENS,
+        spl_token::state::AccountState::Initialized,
+    );
     let mut ix = f.deposit_ix([3; 16], 1, [1, 0], NOW + 900);
     ix.accounts[1].is_signer = false;
-    assert!(f.send(ix, &[]).is_err());
+    rejects(f.send(ix, &[]), 3010);
 }
 
 #[test]
@@ -610,6 +658,186 @@ fn settle_rejects_other_operator_excess_k_redirects_and_expiry() {
     rejects(f.settle(id, 0), code(enki_escrow::EscrowError::Expired));
     assert_eq!(f.tokens(f.pdas(id).1), 4_000_000);
     assert_eq!(f.tokens(f.treasury_ata), 0);
+}
+
+#[test]
+fn deposit_requires_configured_operator_even_for_buyer_chosen_terms() {
+    let mut f = Fixture::new();
+    f.init();
+    let id = [20; 16];
+    for (payer, roles) in [
+        (f.buyer.pubkey(), vec![Role::Buyer]),
+        (f.stranger.pubkey(), vec![Role::Buyer, Role::Stranger]),
+    ] {
+        let mut ix = f.deposit_ix(id, 24, [1, 1], NOW + 600);
+        ix.accounts[2].pubkey = payer;
+        ix.data = instruction::Deposit {
+            intent_id: id,
+            units: 24,
+            recipient_owners: [f.treasury, f.buyer.pubkey()],
+            unit_amounts: [1, 1],
+            expires_at: NOW + 600,
+        }
+        .data();
+        rejects(
+            f.send(ix, &roles),
+            code(enki_escrow::EscrowError::Unauthorized),
+        );
+        assert_eq!(f.tokens(f.buyer_ata), BUYER_TOKENS);
+        for address in [f.pdas(id).0, f.pdas(id).1] {
+            assert!(f.svm.get_account(&address).is_none_or(|a| a.lamports == 0));
+        }
+    }
+    f.deposit(id, 4, [900_000, 100_000]);
+    assert_eq!(f.escrow(id).rent_payer, f.operator.pubkey());
+    assert_eq!(f.tokens(f.pdas(id).1), 4_000_000);
+}
+
+#[test]
+fn deposit_requires_server_signature_even_when_buyer_pays_transaction_fee() {
+    let mut f = Fixture::new();
+    f.init();
+    let id = [21; 16];
+    let mut ix = f.deposit_ix(id, 1, [1_000_000, 0], NOW + 900);
+    ix.accounts[2].is_signer = false;
+    f.svm.expire_blockhash();
+    let message =
+        Message::new_with_blockhash(&[ix], Some(&f.buyer.pubkey()), &f.svm.latest_blockhash());
+    let transaction =
+        VersionedTransaction::try_new(VersionedMessage::Legacy(message), &[&f.buyer]).unwrap();
+    rejects(f.svm.send_transaction(transaction), 3010);
+    assert_eq!(f.tokens(f.buyer_ata), BUYER_TOKENS);
+    assert!(f
+        .svm
+        .get_account(&f.pdas(id).0)
+        .is_none_or(|a| a.lamports == 0));
+    f.deposit(id, 1, [1_000_000, 0]);
+}
+
+#[test]
+fn unusable_artist_ata_cannot_block_treasury_settlement() {
+    for change in UNUSABLE_ATAS {
+        let mut f = Fixture::new();
+        f.init();
+        let id = [22; 16];
+        f.deposit(id, 4, [900_000, 100_000]);
+        f.change_ata(f.artist_ata, change);
+        let unavailable = f.svm.get_account(&f.artist_ata).unwrap();
+        f.settle(id, 4).unwrap();
+        assert_eq!(f.tokens(f.treasury_ata), 3_600_000, "{change:?}");
+        assert_eq!(
+            f.svm.get_account(&f.artist_ata).unwrap(),
+            unavailable,
+            "{change:?}"
+        );
+        assert_eq!(f.tokens(f.pdas(id).1), 400_000);
+        assert!(matches!(
+            f.escrow(id).state,
+            enki_escrow::EscrowState::Settled
+        ));
+        f.reclaim(id).unwrap();
+        assert_eq!(f.tokens(f.buyer_ata), BUYER_TOKENS - 3_600_000);
+    }
+}
+
+#[test]
+fn zero_refund_closes_with_unusable_buyer_ata_and_returns_stored_rent() {
+    for change in UNUSABLE_ATAS {
+        let mut f = Fixture::new();
+        f.init();
+        let id = [23; 16];
+        f.deposit(id, 1, [1_000_000, 0]);
+        f.settle(id, 1).unwrap();
+        f.change_ata(f.buyer_ata, change);
+        let unavailable = f.svm.get_account(&f.buyer_ata).unwrap();
+        let (escrow, vault) = f.pdas(id);
+        let rent = f.svm.get_balance(&escrow).unwrap() + f.svm.get_balance(&vault).unwrap();
+        let payer_before = f.svm.get_balance(&f.payer.pubkey()).unwrap();
+        let ix = f.reclaim_ix(id, f.payer.pubkey(), false);
+        f.send_as_stranger(ix).unwrap();
+        assert_eq!(
+            f.svm.get_account(&f.buyer_ata).unwrap(),
+            unavailable,
+            "{change:?}"
+        );
+        assert_eq!(f.tokens(f.treasury_ata), 1_000_000);
+        assert_eq!(
+            f.svm.get_balance(&f.payer.pubkey()).unwrap(),
+            payer_before + rent
+        );
+        assert!(f.svm.get_account(&escrow).is_none_or(|a| a.lamports == 0));
+        assert!(f.svm.get_account(&vault).is_none_or(|a| a.lamports == 0));
+    }
+}
+
+#[test]
+fn positive_refund_rejects_unusable_buyer_and_succeeds_after_restore() {
+    use enki_escrow::EscrowError as E;
+    for (change, error) in [
+        (AtaChange::ReassignedOwner, E::WrongTokenOwner),
+        (AtaChange::WrongMint, E::WrongMint),
+        (AtaChange::WrongProgram, E::WrongTokenProgram),
+        (AtaChange::Malformed, E::InvalidTokenAccount),
+        (AtaChange::Uninitialized, E::InvalidTokenAccount),
+        (AtaChange::Frozen, E::FrozenBuyerAta),
+    ] {
+        let mut f = Fixture::new();
+        f.init();
+        let id = [24; 16];
+        f.deposit(id, 4, [1_000_000, 0]);
+        f.settle(id, 2).unwrap();
+        let original_buyer = f.svm.get_account(&f.buyer_ata).unwrap();
+        f.change_ata(f.buyer_ata, change);
+        let (escrow, vault) = f.pdas(id);
+        let original_escrow = f.svm.get_account(&escrow).unwrap();
+        let original_vault = f.svm.get_account(&vault).unwrap();
+        rejects(f.reclaim(id), code(error));
+        assert_eq!(
+            f.svm.get_account(&escrow).unwrap(),
+            original_escrow,
+            "{change:?}"
+        );
+        assert_eq!(
+            f.svm.get_account(&vault).unwrap(),
+            original_vault,
+            "{change:?}"
+        );
+        assert_eq!(f.tokens(vault), 2_000_000);
+        assert_eq!(f.tokens(f.treasury_ata), 2_000_000);
+        f.svm.set_account(f.buyer_ata, original_buyer).unwrap();
+        f.reclaim(id).unwrap();
+        assert_eq!(f.tokens(f.buyer_ata), BUYER_TOKENS - 2_000_000);
+    }
+}
+
+#[test]
+fn operator_rotation_does_not_redirect_old_rent_or_missing_ata_sponsorship() {
+    let mut f = Fixture::new();
+    f.init();
+    let id = [25; 16];
+    f.deposit(id, 1, [1_500_000, 0]);
+    f.settle(id, 0).unwrap();
+    let mut args = f.args();
+    args.operator = f.stranger.pubkey();
+    f.send(f.update_ix(f.admin.pubkey(), args), &[Role::Admin])
+        .unwrap();
+    rejects(
+        f.send(f.deposit_ix([26; 16], 1, [1, 0], NOW + 900), &[Role::Buyer]),
+        code(enki_escrow::EscrowError::Unauthorized),
+    );
+    f.remove_ata(f.buyer_ata);
+    let ix = f.reclaim_ix(id, f.stranger.pubkey(), true);
+    rejects(
+        f.send(ix, &[Role::Stranger]),
+        code(enki_escrow::EscrowError::WrongRentPayer),
+    );
+    f.reclaim(id).unwrap();
+    assert_eq!(f.tokens(f.buyer_ata), 500_000);
+    assert_eq!(f.tokens(f.treasury_ata), 1_000_000);
+    assert!(f
+        .svm
+        .get_account(&f.pdas(id).0)
+        .is_none_or(|a| a.lamports == 0));
 }
 
 #[test]

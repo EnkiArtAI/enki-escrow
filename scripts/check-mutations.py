@@ -14,6 +14,24 @@ BINARY = ROOT / "target/deploy/enki_escrow.so"
 PARTIAL = "partial_delivery_pays_exact_units_refunds_rest_and_returns_rent"
 MUTATIONS = (
     (
+        "unusable-artist-blocks-treasury",
+        b".unwrap_or(TokenStatus::Frozen)",
+        b"?",
+        "unusable_artist_ata_cannot_block_treasury_settlement",
+    ),
+    (
+        "unbound-deposit-server",
+        b"mut, address = config.operator @ EscrowError::Unauthorized",
+        b"mut",
+        "deposit_requires_configured_operator_even_for_buyer_chosen_terms",
+    ),
+    (
+        "check-buyer-ata-with-zero-refund",
+        b"let missing = if remaining > 0 {",
+        b"let missing = if true {",
+        "zero_refund_closes_with_unusable_buyer_ata_and_returns_stored_rent",
+    ),
+    (
         "restore-second-deposit-cap",
         b"total <= cap, EscrowError::DepositCap",
         b"total <= cap && total <= 25_000_000, EscrowError::DepositCap",
