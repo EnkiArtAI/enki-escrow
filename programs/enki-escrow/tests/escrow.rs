@@ -53,7 +53,7 @@ impl Fixture {
         let payer = operator.insecure_clone();
         let buyer = Keypair::new();
         let stranger = Keypair::new();
-        for key in [&admin, &guardian, &operator, &payer, &buyer, &stranger] {
+        for key in [&admin, &guardian, &operator, &buyer, &stranger] {
             svm.airdrop(&key.pubkey(), 10_000_000_000).unwrap();
         }
         // Reproduce an upgradeable deployment so init_config tests the actual loader authority.
