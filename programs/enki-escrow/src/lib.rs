@@ -106,6 +106,7 @@ pub mod enki_escrow {
             settled_units: 0,
             created_at,
             expires_at,
+            refund_due: amount,
         });
         emit!(Deposited {
             escrow: ctx.accounts.escrow.key(),
@@ -147,6 +148,10 @@ pub mod enki_escrow {
         let paid = treasury_paid
             .checked_add(artist_paid)
             .ok_or(EscrowError::Overflow)?;
+        let refund_due = escrow
+            .refund_due
+            .checked_sub(paid)
+            .ok_or(EscrowError::Overflow)?;
         require!(
             ctx.accounts.vault.amount >= paid,
             EscrowError::InsufficientVault
@@ -178,6 +183,7 @@ pub mod enki_escrow {
         let escrow = &mut ctx.accounts.escrow;
         escrow.state = EscrowState::Settled;
         escrow.settled_units = k;
+        escrow.refund_due = refund_due;
         emit!(Settled {
             escrow: escrow.key(),
             k,
@@ -193,8 +199,14 @@ pub mod enki_escrow {
                 || Clock::get()?.unix_timestamp >= escrow.expires_at,
             EscrowError::NotReclaimable
         );
-        let remaining = ctx.accounts.vault.amount;
-        let missing = if remaining > 0 {
+        let remaining = ctx.accounts.vault.amount.min(escrow.refund_due);
+        let surplus = ctx
+            .accounts
+            .vault
+            .amount
+            .checked_sub(remaining)
+            .ok_or(EscrowError::Overflow)?;
+        let missing = if escrow.refund_due > 0 {
             let buyer_status = canonical_token_status(
                 &ctx.accounts.buyer_ata.to_account_info(),
                 escrow.buyer,
@@ -216,6 +228,7 @@ pub mod enki_escrow {
         }
         let (refund, ata_fee, create_ata) =
             refund_amounts(remaining, missing, ctx.accounts.config.refund_ata_fee_micro);
+        let treasury_refund = ata_fee.checked_add(surplus).ok_or(EscrowError::Overflow)?;
         if create_ata {
             associated_token::create(CpiContext::new(
                 ctx.accounts.associated_token_program.to_account_info(),
@@ -241,7 +254,7 @@ pub mod enki_escrow {
             ctx.accounts.treasury_ata.to_account_info(),
             ctx.accounts.escrow.to_account_info(),
             signer,
-            ata_fee,
+            treasury_refund,
         )?;
         transfer_from_vault(
             ctx.accounts.token_program.to_account_info(),
@@ -354,6 +367,7 @@ pub struct Escrow {
     pub settled_units: u8,
     pub created_at: i64,
     pub expires_at: i64,
+    pub refund_due: u64,
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq, InitSpace)]
@@ -654,7 +668,7 @@ mod tests {
     #[test]
     fn account_layout_matches_ticket() {
         assert_eq!(8 + Config::INIT_SPACE, 170);
-        assert_eq!(8 + Escrow::INIT_SPACE, 223);
+        assert_eq!(8 + Escrow::INIT_SPACE, 231);
     }
 
     #[test]

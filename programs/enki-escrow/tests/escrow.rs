@@ -228,6 +228,33 @@ impl Fixture {
         self.svm.send_transaction(tx)
     }
 
+    fn send_as_buyer(&mut self, ix: Instruction) -> TransactionResult {
+        self.svm.expire_blockhash();
+        let msg = Message::new_with_blockhash(
+            &[ix],
+            Some(&self.buyer.pubkey()),
+            &self.svm.latest_blockhash(),
+        );
+        let tx =
+            VersionedTransaction::try_new(VersionedMessage::Legacy(msg), &[&self.buyer]).unwrap();
+        self.svm.send_transaction(tx)
+    }
+
+    fn donate(&mut self, id: [u8; 16], amount: u64) {
+        let ix = spl_token::instruction::transfer_checked(
+            &token::ID,
+            &self.buyer_ata,
+            &USDC_MINT,
+            &self.pdas(id).1,
+            &self.buyer.pubkey(),
+            &[],
+            amount,
+            6,
+        )
+        .unwrap();
+        self.send_as_buyer(ix).unwrap();
+    }
+
     fn deposit_ix(
         &self,
         intent_id: [u8; 16],
@@ -506,6 +533,30 @@ fn init_requires_actual_upgrade_authority_and_cannot_reinitialize() {
 }
 
 #[test]
+fn init_rejects_another_programs_program_data_even_when_its_authority_signs() {
+    let mut f = Fixture::new();
+    let other_program = Pubkey::new_unique();
+    let other_data =
+        Pubkey::find_program_address(&[other_program.as_ref()], &bpf_loader_upgradeable::ID).0;
+    let data = bincode::serialize(&UpgradeableLoaderState::ProgramData {
+        slot: 0,
+        upgrade_authority_address: Some(f.stranger.pubkey()),
+    })
+    .unwrap();
+    f.set_data(other_data, data, bpf_loader_upgradeable::ID);
+    let mut args = f.args();
+    args.admin = f.stranger.pubkey();
+    let mut ix = f.init_ix(f.stranger.pubkey(), args);
+    ix.accounts[3].pubkey = other_data;
+    rejects(
+        f.send_as_stranger(ix),
+        code(enki_escrow::EscrowError::WrongProgramData),
+    );
+    assert!(f.svm.get_account(&f.config).is_none_or(|a| a.lamports == 0));
+    f.init();
+}
+
+#[test]
 fn partial_delivery_pays_exact_units_refunds_rest_and_returns_rent() {
     let mut f = Fixture::new();
     f.init();
@@ -513,7 +564,8 @@ fn partial_delivery_pays_exact_units_refunds_rest_and_returns_rent() {
     let before = f.tokens(f.buyer_ata);
     f.deposit(id, 4, [900_000, 100_000]);
     let (escrow, vault) = f.pdas(id);
-    assert_eq!(f.svm.get_account(&escrow).unwrap().data.len(), 223);
+    assert_eq!(f.svm.get_account(&escrow).unwrap().data.len(), 231);
+    assert_eq!(f.escrow(id).refund_due, 4_000_000);
     assert_eq!(f.tokens(vault), 4_000_000);
     assert_eq!(f.tokens(f.buyer_ata), before - 4_000_000);
     let immutable = f.svm.get_account(&escrow).unwrap().data;
@@ -522,9 +574,10 @@ fn partial_delivery_pays_exact_units_refunds_rest_and_returns_rent() {
     assert_eq!(f.tokens(f.treasury_ata), 1_800_000);
     assert_eq!(f.tokens(f.artist_ata), 200_000);
     assert_eq!(f.tokens(vault), 2_000_000);
+    assert_eq!(f.escrow(id).refund_due, 2_000_000);
     let after = f.svm.get_account(&escrow).unwrap().data;
     for index in 0..immutable.len() {
-        if index != 9 && index != 206 {
+        if index != 9 && index != 206 && !(223..231).contains(&index) {
             assert_eq!(
                 immutable[index], after[index],
                 "deposit field changed at {index}"
@@ -715,6 +768,146 @@ fn deposit_requires_server_signature_even_when_buyer_pays_transaction_fee() {
 }
 
 #[test]
+fn settle_requires_operator_signature_even_when_stranger_pays_transaction_fee() {
+    let mut f = Fixture::new();
+    f.init();
+    let id = [27; 16];
+    f.deposit(id, 4, [900_000, 100_000]);
+    let (escrow, vault) = f.pdas(id);
+    let before = f.svm.get_account(&escrow).unwrap();
+    let mut ix = f.settle_ix(id, 2, f.operator.pubkey());
+    ix.accounts[1].is_signer = false;
+    rejects(f.send_as_stranger(ix), 3010);
+    assert_eq!(f.svm.get_account(&escrow).unwrap(), before);
+    assert_eq!(f.tokens(vault), 4_000_000);
+    assert_eq!(f.tokens(f.treasury_ata), 0);
+    assert_eq!(f.tokens(f.artist_ata), 0);
+    f.settle(id, 2).unwrap();
+    assert_eq!(f.escrow(id).refund_due, 2_000_000);
+}
+
+#[test]
+fn donated_dust_cannot_lock_zero_refund_or_stored_rent() {
+    for donate_after_settle in [false, true] {
+        let mut f = Fixture::new();
+        f.init();
+        let id = [28; 16];
+        f.deposit(id, 1, [1_000_000, 0]);
+        if donate_after_settle {
+            f.settle(id, 1).unwrap();
+        }
+        // Both the donation and ATA reassignment are real buyer-signed SPL instructions.
+        f.donate(id, 1);
+        let reassign = spl_token::instruction::set_authority(
+            &token::ID,
+            &f.buyer_ata,
+            Some(&f.stranger.pubkey()),
+            spl_token::instruction::AuthorityType::AccountOwner,
+            &f.buyer.pubkey(),
+            &[],
+        )
+        .unwrap();
+        f.send_as_buyer(reassign).unwrap();
+        if !donate_after_settle {
+            f.settle(id, 1).unwrap();
+        }
+        assert_eq!(f.escrow(id).refund_due, 0);
+        let (escrow, vault) = f.pdas(id);
+        assert_eq!(f.tokens(vault), 1);
+        let buyer_account = f.svm.get_account(&f.buyer_ata).unwrap();
+        let rent = f.svm.get_balance(&escrow).unwrap() + f.svm.get_balance(&vault).unwrap();
+        let payer_before = f.svm.get_balance(&f.payer.pubkey()).unwrap();
+        let ix = f.reclaim_ix(id, f.payer.pubkey(), false);
+        f.send_as_stranger(ix).unwrap();
+        assert_eq!(f.svm.get_account(&f.buyer_ata).unwrap(), buyer_account);
+        assert_eq!(f.tokens(f.treasury_ata), 1_000_001);
+        assert_eq!(
+            f.svm.get_balance(&f.payer.pubkey()).unwrap(),
+            payer_before + rent
+        );
+        assert!(f.svm.get_account(&escrow).is_none_or(|a| a.lamports == 0));
+        assert!(f.svm.get_account(&vault).is_none_or(|a| a.lamports == 0));
+    }
+}
+
+#[test]
+fn donations_do_not_increase_partial_artist_or_expired_buyer_refunds() {
+    for (delivered, unavailable_artist) in [(None, false), (Some(2), false), (Some(4), true)] {
+        let mut f = Fixture::new();
+        f.init();
+        let id = [29; 16];
+        f.deposit(id, 4, [900_000, 100_000]);
+        f.donate(id, 1_000_001);
+        if unavailable_artist {
+            f.change_ata(f.artist_ata, AtaChange::ReassignedOwner);
+        }
+        let k = delivered.unwrap_or(0);
+        if delivered.is_some() {
+            f.settle(id, k).unwrap();
+        } else {
+            f.clock(NOW + 900);
+        }
+        let treasury_paid = u64::from(k) * 900_000;
+        let artist_paid = if unavailable_artist {
+            0
+        } else {
+            u64::from(k) * 100_000
+        };
+        let due = 4_000_000 - treasury_paid - artist_paid;
+        assert_eq!(f.escrow(id).refund_due, due);
+        assert_eq!(f.tokens(f.pdas(id).1), due + 1_000_001);
+        f.reclaim(id).unwrap();
+        assert_eq!(
+            f.tokens(f.buyer_ata),
+            BUYER_TOKENS - treasury_paid - artist_paid - 1_000_001
+        );
+        assert_eq!(f.tokens(f.treasury_ata), treasury_paid + 1_000_001);
+        assert_eq!(f.tokens(f.artist_ata), artist_paid);
+        assert!(f
+            .svm
+            .get_account(&f.pdas(id).0)
+            .is_none_or(|a| a.lamports == 0));
+    }
+}
+
+#[test]
+fn donations_do_not_change_missing_buyer_ata_fee_boundaries() {
+    for due in [0, 999_999, 1_000_000, 1_500_000] {
+        let mut f = Fixture::new();
+        f.init();
+        let id = [30; 16];
+        f.deposit(id, 1, [due.max(1), 0]);
+        f.donate(id, 2_000_000);
+        f.settle(id, u8::from(due == 0)).unwrap();
+        assert_eq!(f.escrow(id).refund_due, due);
+        f.remove_ata(f.buyer_ata);
+        let ix = f.reclaim_ix(id, f.payer.pubkey(), false);
+        if due == 0 {
+            f.send_as_stranger(ix).unwrap();
+        } else {
+            f.reclaim(id).unwrap();
+        }
+        assert_eq!(
+            f.tokens(f.treasury_ata),
+            2_000_000 + due.min(1_000_000) + u64::from(due == 0)
+        );
+        assert_eq!(f.tokens(f.buyer_ata), due.saturating_sub(1_000_000));
+        if due >= 1_000_000 {
+            assert_eq!(f.svm.get_account(&f.buyer_ata).unwrap().owner, token::ID);
+        } else {
+            assert!(f
+                .svm
+                .get_account(&f.buyer_ata)
+                .is_none_or(|a| a.lamports == 0));
+        }
+        assert!(f
+            .svm
+            .get_account(&f.pdas(id).0)
+            .is_none_or(|a| a.lamports == 0));
+    }
+}
+
+#[test]
 fn unusable_artist_ata_cannot_block_treasury_settlement() {
     for change in UNUSABLE_ATAS {
         let mut f = Fixture::new();
@@ -731,6 +924,7 @@ fn unusable_artist_ata_cannot_block_treasury_settlement() {
             "{change:?}"
         );
         assert_eq!(f.tokens(f.pdas(id).1), 400_000);
+        assert_eq!(f.escrow(id).refund_due, 400_000);
         assert!(matches!(
             f.escrow(id).state,
             enki_escrow::EscrowState::Settled
@@ -1080,8 +1274,10 @@ fn randomized_100000_program_sequences_conserve_tokens_and_never_pay_twice() {
         let treasury_before = f.tokens(f.treasury_ata);
         let artist_before = f.tokens(f.artist_ata);
         f.deposit(id, units, amounts);
+        assert_eq!(f.escrow(id).refund_due, u64::from(units) * per_unit);
         let k = (random.rotate_left(41) % (u64::from(units) + 1)) as u8;
         f.settle(id, k).unwrap();
+        assert_eq!(f.escrow(id).refund_due, u64::from(units - k) * per_unit);
         rejects(
             f.settle(id, k),
             code(enki_escrow::EscrowError::AlreadySettled),

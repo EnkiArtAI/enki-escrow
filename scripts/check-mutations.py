@@ -27,9 +27,27 @@ MUTATIONS = (
     ),
     (
         "check-buyer-ata-with-zero-refund",
-        b"let missing = if remaining > 0 {",
+        b"let missing = if escrow.refund_due > 0 {",
         b"let missing = if true {",
         "zero_refund_closes_with_unusable_buyer_ata_and_returns_stored_rent",
+    ),
+    (
+        "donated-dust-gates-buyer-validation",
+        b"let missing = if escrow.refund_due > 0 {",
+        b"let missing = if ctx.accounts.vault.amount > 0 {",
+        "donated_dust_cannot_lock_zero_refund_or_stored_rent",
+    ),
+    (
+        "unsigned-settlement-operator",
+        b"pub operator: Signer<'info>,",
+        b"/// CHECK: deliberately remove the settlement signature requirement.\n    pub operator: UncheckedAccount<'info>,",
+        "settle_requires_operator_signature_even_when_stranger_pays_transaction_fee",
+    ),
+    (
+        "unbound-initialization-program-data",
+        b"#[account(constraint = program.programdata_address()? == Some(program_data.key()) @ EscrowError::WrongProgramData)]",
+        b"",
+        "init_rejects_another_programs_program_data_even_when_its_authority_signs",
     ),
     (
         "restore-second-deposit-cap",

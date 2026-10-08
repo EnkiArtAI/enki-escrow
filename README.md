@@ -21,10 +21,17 @@ The specification is [ClickUp 123qmzqzw1w](https://app.clickup.com/t/9015834867/
 - An unusable canonical artist ATA forfeits its leg to the buyer refund while
   settlement still pays the treasury. Noncanonical recipient addresses are rejected.
 - Any caller can reclaim after settlement or expiry; refunds and account rent go to the stored destinations.
-- With zero balance, reclaim closes without inspecting buyer ATA contents. With
-  positive balance, an unusable buyer ATA preserves the escrow until restored;
+- With no recorded buyer refund due, reclaim closes without inspecting buyer ATA contents,
+  even when someone has donated tokens to the vault. With a positive refund due,
+  an unusable buyer ATA preserves the escrow until restored;
   a missing ATA retains the existing recreation/fee rules. Operator rotation
   does not change the stored rent payer of earlier deposits.
+- Escrow records `refund_due`: the deposit total, less the treasury and artist
+  amounts actually paid at settlement. Reclaim applies the existing refund and
+  missing-ATA fee rules to `min(vault.amount, refund_due)` and sweeps any surplus
+  to the stored treasury. Donations never increase the buyer's claim, purchased
+  units, or missing-ATA fee branch. The Escrow account is 231 bytes including its
+  discriminator; clients require the compiled interface for this layout.
 - A guardian can pause new deposits or revoke the operator. Restoring authority requires the admin.
 
 Tests use an in-process Solana VM and disposable wallets. They require no Enki secrets, live RPC connection or paid generation API.
@@ -45,7 +52,7 @@ The VM tests require `target/deploy/enki_escrow.so` and fail when it is absent. 
 
 The host VM tests use optimization level 1 with overflow checks and debug assertions enabled. The 100,000-sequence test reports progress every 10,000 sequences in CI.
 
-After the original program passes, Linux CI compiles seven deliberately faulty programs and requires the matching VM tests to fail: artist-account errors blocking treasury payment, an unbound deposit signer, checking buyer ATA contents with zero refund, restoring a second fixed deposit cap, allowing repeated settlement, charging for undelivered units, and refunding without deducting the missing-ATA fee. `scripts/check-mutations.py` restores the original source and SBF binary in a `finally` block. A compilation failure does not count as mutation proof.
+After the original program passes, Linux CI compiles ten deliberately faulty programs and requires the matching VM tests to fail: artist-account errors blocking treasury payment, an unbound deposit signer, checking buyer ATA contents with zero refund, letting donation dust trigger buyer validation, an unsigned settlement operator, another program's ProgramData authorizing initialization, restoring a second fixed deposit cap, allowing repeated settlement, charging for undelivered units, and refunding without deducting the missing-ATA fee. `scripts/check-mutations.py` restores the original source and SBF binary in a `finally` block. A compilation failure does not count as mutation proof.
 
 CI also exports the Anchor IDL compiled from the Rust source as `enki-escrow-idl`, with its SHA-256 and source commit. The server client must be generated from this artifact. The pinned Anchor 0.32.1 CLI is checksum-verified and `anchor idl build` runs without a wallet or RPC connection.
 
