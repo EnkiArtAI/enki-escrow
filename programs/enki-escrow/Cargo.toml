@@ -1,0 +1,41 @@
+[package]
+name = "enki-escrow"
+version = "0.1.0"
+description = "Per-image USDC escrow for Enki paid generation intents"
+edition = "2021"
+license = "Apache-2.0"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "enki_escrow"
+
+[features]
+default = ["devnet"]
+devnet = []
+mainnet = []
+cpi = ["no-entrypoint"]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
+
+[dependencies]
+anchor-lang = "=0.32.1"
+# Anchor 0.32 calls AccountInfo::resize, introduced in Solana's 2.3 account API.
+solana-account-info = "=2.3.0"
+# Anchor's account-init macro references token_2022 helpers even for typed classic Token accounts.
+anchor-spl = { version = "=0.32.1", default-features = false, features = ["token", "associated_token", "token_2022"] }
+
+[dev-dependencies]
+bincode = "1.3.3"
+litesvm = "=0.7.1"
+solana-account = "2.2"
+solana-keypair = "2.2"
+solana-message = "2.2"
+solana-signer = "2.2"
+solana-transaction = "2.2"
+solana-transaction-error = "2.2"
+openssl = { version = "0.10", features = ["vendored"] }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("solana"))', 'cfg(feature, values("anchor-debug", "custom-heap", "custom-panic"))'] }
