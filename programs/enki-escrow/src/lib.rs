@@ -5,7 +5,7 @@ use anchor_spl::{
     token::{self, CloseAccount, Mint, Token, TokenAccount, TransferChecked},
 };
 
-declare_id!("hNNT7mTmthTVvnw4NYo6jYoBTDazRgweWTBHBmwgcak");
+declare_id!("2sfm76FMcfqUYCv47J4VCNFMrp6PpfD6QYpmWqBCPyJV");
 
 #[cfg(all(feature = "devnet", feature = "mainnet"))]
 compile_error!("Select exactly one cluster: devnet or mainnet.");

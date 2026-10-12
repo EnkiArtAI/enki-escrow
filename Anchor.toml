@@ -7,7 +7,10 @@ resolution = true
 skip-lint = false
 
 [programs.localnet]
-enki_escrow = "hNNT7mTmthTVvnw4NYo6jYoBTDazRgweWTBHBmwgcak"
+enki_escrow = "2sfm76FMcfqUYCv47J4VCNFMrp6PpfD6QYpmWqBCPyJV"
+
+[programs.devnet]
+enki_escrow = "2sfm76FMcfqUYCv47J4VCNFMrp6PpfD6QYpmWqBCPyJV"
 
 [provider]
 cluster = "Localnet"
