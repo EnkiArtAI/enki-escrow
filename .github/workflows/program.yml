@@ -16,7 +16,7 @@ concurrency:
 jobs:
   program-tests:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     env:
       CARGO_TERM_COLOR: always
     steps:
@@ -38,6 +38,8 @@ jobs:
           restore-keys: escrow-${{ runner.os }}-rust1.90-agave2.3-tools1.57-
       - name: Format check
         run: cargo fmt --all -- --check
+      - name: Check mutation targets and exact VM test selectors
+        run: python3 scripts/check-mutations.py --check
       - name: Install checksum-verified SBF tools
         run: bash scripts/install-ci-tools.sh
       - name: Build devnet SBF program
@@ -49,7 +51,7 @@ jobs:
           test -s target/deploy/enki_escrow.so
       - name: Unit and LiteSVM tests, including 100000 program sequences
         run: cargo test --workspace --locked -- --nocapture --test-threads=1
-      - name: Prove settlement and refund regressions fail
+      - name: Prove settlement, refund and author-claim regressions fail
         run: |
           python3 scripts/check-mutations.py
           git diff --exit-code -- programs/enki-escrow/src/lib.rs
@@ -69,6 +71,20 @@ jobs:
         with:
           name: enki-escrow-idl
           path: target/idl/
+          if-no-files-found: error
+      - name: Package the checked Devnet program after mutation restoration
+        run: |
+          test -s target/deploy/enki_escrow.so
+          mkdir -p target/devnet-program
+          cp target/deploy/enki_escrow.so target/devnet-program/enki_escrow.so
+          git rev-parse HEAD > target/devnet-program/program-source-commit.txt
+          cd target/devnet-program
+          sha256sum enki_escrow.so > program.sha256
+      - name: Export the checked Devnet program binary
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: enki-escrow-devnet-program
+          path: target/devnet-program/
           if-no-files-found: error
       - name: Save completed builds for subsequent checks
         if: always() && steps.sbf-build.outcome == 'success' && steps.build-cache.outputs.cache-hit != 'true'
