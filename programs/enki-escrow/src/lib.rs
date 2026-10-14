@@ -551,7 +551,7 @@ pub struct ClaimAuthorVault<'info> {
     pub claimant_wallet: UncheckedAccount<'info>,
     #[account(init_if_needed, payer = operator, associated_token::mint = mint, associated_token::authority = claimant_wallet, associated_token::token_program = token_program)]
     pub claimant_ata: Account<'info, TokenAccount>,
-    #[account(init_if_needed, payer = operator, space = 8 + AuthorClaim::INIT_SPACE, seeds = [b"claim", &x_user_id.to_le_bytes()], bump)]
+    #[account(init_if_needed, payer = operator, space = 8 + AuthorClaim::INIT_SPACE, seeds = [b"claim".as_ref(), &x_user_id.to_le_bytes()], bump)]
     pub author_claim: Account<'info, AuthorClaim>,
     pub token_program: Program<'info, Token>,
     pub associated_token_program: Program<'info, AssociatedToken>,
