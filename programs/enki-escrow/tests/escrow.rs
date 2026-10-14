@@ -2067,14 +2067,47 @@ fn claim_rejects_wrong_mint_and_unusable_source_or_destination_without_losing_fu
     f.svm
         .set_account(fake_mint, f.svm.get_account(&USDC_MINT).unwrap())
         .unwrap();
+    let claimant = f.buyer.pubkey();
+    let (author, author_ata, claim_address) = Fixture::author_pdas(X_USER_ID);
+    let fake_source = get_associated_token_address(&author, &fake_mint);
+    let fake_destination = get_associated_token_address(&claimant, &fake_mint);
+    // Keep every mint-dependent account consistent. Only the mint's address
+    // violates the program's USDC rule, not an earlier ATA init constraint.
+    for (original, destination) in [(author_ata, fake_source), (f.buyer_ata, fake_destination)] {
+        let mut account = f.svm.get_account(&original).unwrap();
+        let mut token = spl_token::state::Account::unpack(&account.data).unwrap();
+        token.mint = fake_mint;
+        spl_token::state::Account::pack(token, &mut account.data).unwrap();
+        f.svm.set_account(destination, account).unwrap();
+    }
+    let unchanged_accounts = [
+        USDC_MINT,
+        fake_mint,
+        author_ata,
+        f.buyer_ata,
+        fake_source,
+        fake_destination,
+    ]
+    .map(|key| (key, f.svm.get_account(&key).unwrap()));
+    let unchanged_claim = f.svm.get_account(&claim_address);
     let mut ix = f.claim_ix(X_USER_ID, f.buyer.pubkey());
     ix.accounts[2].pubkey = fake_mint;
+    ix.accounts[4].pubkey = fake_source;
+    ix.accounts[6].pubkey = fake_destination;
     rejects(
         f.send(ix, &[Role::Operator]),
         code(enki_escrow::EscrowError::WrongMint),
     );
-    assert_eq!(f.tokens(Fixture::author_pdas(X_USER_ID).1), 123_456);
-    f.claim(X_USER_ID, f.buyer.pubkey()).unwrap();
+    for (key, account) in unchanged_accounts {
+        assert_eq!(f.svm.get_account(&key).unwrap(), account);
+    }
+    assert_eq!(f.svm.get_account(&claim_address), unchanged_claim);
+    f.claim(X_USER_ID, claimant).unwrap();
+    assert_eq!(f.tokens(author_ata), 0);
+    assert_eq!(f.tokens(f.buyer_ata), BUYER_TOKENS + 123_456);
+    assert_eq!(f.tokens(fake_source), 123_456);
+    assert_eq!(f.tokens(fake_destination), BUYER_TOKENS);
+    assert_eq!(f.author_claim(X_USER_ID).claimant, claimant);
 }
 
 #[test]
