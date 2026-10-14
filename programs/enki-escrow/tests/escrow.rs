@@ -2,16 +2,16 @@ use anchor_lang::prelude::Pubkey;
 use anchor_lang::solana_program::{
     bpf_loader_upgradeable::{self, UpgradeableLoaderState},
     clock::Clock,
-    instruction::Instruction,
+    instruction::{AccountMeta, Instruction},
     program_option::COption,
     program_pack::Pack,
 };
-use anchor_lang::{AccountDeserialize, InstructionData, ToAccountMetas};
+use anchor_lang::{AccountDeserialize, AccountSerialize, InstructionData, ToAccountMetas};
 use anchor_spl::{
     associated_token::get_associated_token_address,
     token::{self, spl_token},
 };
-use enki_escrow::{accounts, instruction, Config, ConfigArgs, Escrow, ID, USDC_MINT};
+use enki_escrow::{accounts, instruction, AuthorClaim, Config, ConfigArgs, Escrow, ID, USDC_MINT};
 use litesvm::{types::TransactionResult, LiteSVM};
 use solana_account::Account;
 use solana_keypair::Keypair;
@@ -21,6 +21,8 @@ use solana_transaction::versioned::VersionedTransaction;
 
 const NOW: i64 = 1_750_000_000;
 const BUYER_TOKENS: u64 = 5_000_000_000_000;
+const X_USER_ID: u64 = 0x0102_0304_0506_0708;
+const SETTLE_RECIPIENT_OFFSET: usize = 6;
 
 struct Fixture {
     svm: LiteSVM,
@@ -31,11 +33,13 @@ struct Fixture {
     buyer: Keypair,
     stranger: Keypair,
     artist: Pubkey,
+    referrer: Pubkey,
     treasury: Pubkey,
     config: Pubkey,
     buyer_ata: Pubkey,
     treasury_ata: Pubkey,
     artist_ata: Pubkey,
+    referrer_ata: Pubkey,
     program_data: Pubkey,
 }
 
@@ -96,9 +100,11 @@ impl Fixture {
         svm.set_sysvar(&clock);
         let treasury = Pubkey::new_unique();
         let artist = Pubkey::new_unique();
+        let referrer = Pubkey::new_unique();
         let buyer_ata = get_associated_token_address(&buyer.pubkey(), &USDC_MINT);
         let treasury_ata = get_associated_token_address(&treasury, &USDC_MINT);
         let artist_ata = get_associated_token_address(&artist, &USDC_MINT);
+        let referrer_ata = get_associated_token_address(&referrer, &USDC_MINT);
         let mut f = Self {
             svm,
             admin,
@@ -109,10 +115,12 @@ impl Fixture {
             stranger,
             treasury,
             artist,
+            referrer,
             config: Pubkey::find_program_address(&[b"config"], &ID).0,
             buyer_ata,
             treasury_ata,
             artist_ata,
+            referrer_ata,
             program_data,
         };
         let mint = spl_token::state::Mint {
@@ -143,6 +151,13 @@ impl Fixture {
             0,
             spl_token::state::AccountState::Initialized,
         );
+        f.set_tokens(
+            f.referrer_ata,
+            f.referrer,
+            0,
+            spl_token::state::AccountState::Initialized,
+        );
+        f.set_author_balance(X_USER_ID, 0);
         f
     }
 
@@ -262,6 +277,40 @@ impl Fixture {
         amounts: [u64; 2],
         expiry: i64,
     ) -> Instruction {
+        let unit_amounts = [amounts[0], amounts[1], 0, 0];
+        self.deposit_four_ix(
+            intent_id,
+            units,
+            self.recipient_owners(unit_amounts),
+            unit_amounts,
+            expiry,
+        )
+    }
+
+    fn recipient_owners(&self, amounts: [u64; 4]) -> [Pubkey; 4] {
+        let owners = [
+            self.treasury,
+            self.artist,
+            self.referrer,
+            Self::author_pdas(X_USER_ID).0,
+        ];
+        std::array::from_fn(|slot| {
+            if slot != 0 && amounts[slot] == 0 {
+                Pubkey::default()
+            } else {
+                owners[slot]
+            }
+        })
+    }
+
+    fn deposit_four_ix(
+        &self,
+        intent_id: [u8; 16],
+        units: u8,
+        recipient_owners: [Pubkey; 4],
+        unit_amounts: [u64; 4],
+        expiry: i64,
+    ) -> Instruction {
         let (escrow, vault) = self.pdas(intent_id);
         Instruction {
             program_id: ID,
@@ -281,15 +330,8 @@ impl Fixture {
             data: instruction::Deposit {
                 intent_id,
                 units,
-                recipient_owners: [
-                    self.treasury,
-                    if amounts[1] == 0 {
-                        Pubkey::default()
-                    } else {
-                        self.artist
-                    },
-                ],
-                unit_amounts: amounts,
+                recipient_owners,
+                unit_amounts,
                 expires_at: expiry,
             }
             .data(),
@@ -304,22 +346,45 @@ impl Fixture {
         .unwrap();
     }
 
+    fn deposit_four(&mut self, id: [u8; 16], units: u8, amounts: [u64; 4]) {
+        self.send(
+            self.deposit_four_ix(
+                id,
+                units,
+                self.recipient_owners(amounts),
+                amounts,
+                NOW + 900,
+            ),
+            &[Role::Buyer],
+        )
+        .unwrap();
+    }
+
     fn settle_ix(&self, id: [u8; 16], k: u8, operator: Pubkey) -> Instruction {
         let (escrow, vault) = self.pdas(id);
-        let artist_owner = self.escrow(id).recipient_owners[1];
+        let stored = self.escrow(id);
+        let mut metas = accounts::Settle {
+            config: self.config,
+            operator,
+            escrow,
+            vault,
+            mint: USDC_MINT,
+            token_program: token::ID,
+        }
+        .to_account_metas(None);
+        for slot in 0..usize::from(stored.recipient_count) {
+            metas.push(if stored.unit_amounts[slot] == 0 {
+                AccountMeta::new_readonly(anchor_lang::system_program::ID, false)
+            } else {
+                AccountMeta::new(
+                    get_associated_token_address(&stored.recipient_owners[slot], &USDC_MINT),
+                    false,
+                )
+            });
+        }
         Instruction {
             program_id: ID,
-            accounts: accounts::Settle {
-                config: self.config,
-                operator,
-                escrow,
-                vault,
-                mint: USDC_MINT,
-                treasury_ata: self.treasury_ata,
-                artist_ata: get_associated_token_address(&artist_owner, &USDC_MINT),
-                token_program: token::ID,
-            }
-            .to_account_metas(None),
+            accounts: metas,
             data: instruction::Settle { k }.data(),
         }
     }
@@ -380,6 +445,61 @@ impl Fixture {
             .filter(|a| a.owner == token::ID)
             .map(|a| spl_token::state::Account::unpack(&a.data).unwrap().amount)
             .unwrap_or(0)
+    }
+
+    fn author_pdas(x_user_id: u64) -> (Pubkey, Pubkey, Pubkey) {
+        let author = Pubkey::find_program_address(&[b"author", &x_user_id.to_le_bytes()], &ID).0;
+        let author_ata = get_associated_token_address(&author, &USDC_MINT);
+        let claim = Pubkey::find_program_address(&[b"claim", &x_user_id.to_le_bytes()], &ID).0;
+        (author, author_ata, claim)
+    }
+
+    fn set_author_balance(&mut self, x_user_id: u64, amount: u64) {
+        let (author, author_ata, _) = Self::author_pdas(x_user_id);
+        self.set_tokens(
+            author_ata,
+            author,
+            amount,
+            spl_token::state::AccountState::Initialized,
+        );
+    }
+
+    fn author_claim(&self, x_user_id: u64) -> AuthorClaim {
+        let account = self
+            .svm
+            .get_account(&Self::author_pdas(x_user_id).2)
+            .unwrap();
+        AuthorClaim::try_deserialize(&mut account.data.as_slice()).unwrap()
+    }
+
+    fn claim_ix(&self, x_user_id: u64, claimant: Pubkey) -> Instruction {
+        let (author, author_ata, author_claim) = Self::author_pdas(x_user_id);
+        Instruction {
+            program_id: ID,
+            accounts: accounts::ClaimAuthorVault {
+                config: self.config,
+                operator: self.operator.pubkey(),
+                mint: USDC_MINT,
+                author,
+                author_ata,
+                claimant_wallet: claimant,
+                claimant_ata: get_associated_token_address(&claimant, &USDC_MINT),
+                author_claim,
+                token_program: token::ID,
+                associated_token_program: anchor_spl::associated_token::ID,
+                system_program: anchor_lang::system_program::ID,
+            }
+            .to_account_metas(None),
+            data: instruction::ClaimAuthorVault {
+                x_user_id,
+                claimant,
+            }
+            .data(),
+        }
+    }
+
+    fn claim(&mut self, x_user_id: u64, claimant: Pubkey) -> TransactionResult {
+        self.send(self.claim_ix(x_user_id, claimant), &[Role::Operator])
     }
 
     fn set_data(&mut self, key: Pubkey, data: Vec<u8>, owner: Pubkey) {
@@ -564,26 +684,34 @@ fn partial_delivery_pays_exact_units_refunds_rest_and_returns_rent() {
     let before = f.tokens(f.buyer_ata);
     f.deposit(id, 4, [900_000, 100_000]);
     let (escrow, vault) = f.pdas(id);
-    assert_eq!(f.svm.get_account(&escrow).unwrap().data.len(), 231);
+    assert_eq!(f.svm.get_account(&escrow).unwrap().data.len(), 343);
+    assert_eq!(f.escrow(id).version, 2);
+    assert_eq!(f.escrow(id).paid_amounts, [0; 4]);
     assert_eq!(f.escrow(id).refund_due, 4_000_000);
     assert_eq!(f.tokens(vault), 4_000_000);
     assert_eq!(f.tokens(f.buyer_ata), before - 4_000_000);
-    let immutable = f.svm.get_account(&escrow).unwrap().data;
+    let immutable = f.escrow(id);
     let settled = f.settle(id, 2).unwrap();
     assert!(settled.compute_units_consumed < 200_000);
     assert_eq!(f.tokens(f.treasury_ata), 1_800_000);
     assert_eq!(f.tokens(f.artist_ata), 200_000);
     assert_eq!(f.tokens(vault), 2_000_000);
     assert_eq!(f.escrow(id).refund_due, 2_000_000);
-    let after = f.svm.get_account(&escrow).unwrap().data;
-    for index in 0..immutable.len() {
-        if index != 9 && index != 206 && !(223..231).contains(&index) {
-            assert_eq!(
-                immutable[index], after[index],
-                "deposit field changed at {index}"
-            );
-        }
-    }
+    let after = f.escrow(id);
+    assert_eq!(after.version, immutable.version);
+    assert_eq!(after.bump, immutable.bump);
+    assert_eq!(after.vault_bump, immutable.vault_bump);
+    assert_eq!(after.intent_id, immutable.intent_id);
+    assert_eq!(after.buyer, immutable.buyer);
+    assert_eq!(after.mint, immutable.mint);
+    assert_eq!(after.rent_payer, immutable.rent_payer);
+    assert_eq!(after.recipient_count, immutable.recipient_count);
+    assert_eq!(after.recipient_owners, immutable.recipient_owners);
+    assert_eq!(after.unit_amounts, immutable.unit_amounts);
+    assert_eq!(after.units, immutable.units);
+    assert_eq!(after.created_at, immutable.created_at);
+    assert_eq!(after.expires_at, immutable.expires_at);
+    assert_eq!(after.paid_amounts, [1_800_000, 200_000, 0, 0]);
     rejects(
         f.settle(id, 1),
         code(enki_escrow::EscrowError::AlreadySettled),
@@ -632,8 +760,13 @@ fn deposit_rejects_invalid_numbers_ttl_treasury_mint_and_noncanonical_source() {
     ix.data = instruction::Deposit {
         intent_id: [2; 16],
         units: 1,
-        recipient_owners: [f.stranger.pubkey(), Pubkey::default()],
-        unit_amounts: [1, 0],
+        recipient_owners: [
+            f.stranger.pubkey(),
+            Pubkey::default(),
+            Pubkey::default(),
+            Pubkey::default(),
+        ],
+        unit_amounts: [1, 0, 0, 0],
         expires_at: NOW + 900,
     }
     .data();
@@ -696,13 +829,13 @@ fn settle_rejects_other_operator_excess_k_redirects_and_expiry() {
         code(enki_escrow::EscrowError::TooManyDeliveredUnits),
     );
     let mut ix = f.settle_ix(id, 2, f.operator.pubkey());
-    ix.accounts[5].pubkey = f.artist_ata;
+    ix.accounts[SETTLE_RECIPIENT_OFFSET].pubkey = f.artist_ata;
     rejects(
         f.send(ix, &[Role::Operator]),
         code(enki_escrow::EscrowError::NonCanonicalAta),
     );
     let mut ix = f.settle_ix(id, 2, f.operator.pubkey());
-    ix.accounts[6].pubkey = f.treasury_ata;
+    ix.accounts[SETTLE_RECIPIENT_OFFSET + 1].pubkey = f.treasury_ata;
     rejects(
         f.send(ix, &[Role::Operator]),
         code(enki_escrow::EscrowError::NonCanonicalAta),
@@ -727,8 +860,13 @@ fn deposit_requires_configured_operator_even_for_buyer_chosen_terms() {
         ix.data = instruction::Deposit {
             intent_id: id,
             units: 24,
-            recipient_owners: [f.treasury, f.buyer.pubkey()],
-            unit_amounts: [1, 1],
+            recipient_owners: [
+                f.treasury,
+                f.buyer.pubkey(),
+                Pubkey::default(),
+                Pubkey::default(),
+            ],
+            unit_amounts: [1, 1, 0, 0],
             expires_at: NOW + 600,
         }
         .data();
@@ -1296,4 +1434,729 @@ fn randomized_100000_program_sequences_conserve_tokens_and_never_pay_twice() {
             println!("Validated {} of 100000 escrow sequences", iteration + 1);
         }
     }
+}
+
+#[test]
+fn four_recipient_partial_delivery_records_each_paid_leg_and_refunds_only_unused_units() {
+    let mut f = Fixture::new();
+    f.init();
+    let id = [40; 16];
+    let amounts = [700_000, 100_000, 50_000, 150_000];
+    let author_ata = Fixture::author_pdas(X_USER_ID).1;
+    f.deposit_four(id, 4, amounts);
+    let deposited = f.escrow(id);
+    assert_eq!(deposited.version, 2);
+    assert_eq!(deposited.recipient_count, 4);
+    assert_eq!(deposited.recipient_owners, f.recipient_owners(amounts));
+    assert_eq!(deposited.unit_amounts, amounts);
+    assert_eq!(deposited.paid_amounts, [0; 4]);
+    assert_eq!(f.svm.get_account(&f.pdas(id).0).unwrap().data.len(), 343);
+    assert_eq!(deposited.refund_due, 4_000_000);
+    let settled = f.settle(id, 2).unwrap();
+    assert!(settled.compute_units_consumed < 200_000);
+    println!(
+        "Four-recipient settle consumed {} compute units",
+        settled.compute_units_consumed
+    );
+    assert_eq!(
+        f.escrow(id).paid_amounts,
+        [1_400_000, 200_000, 100_000, 300_000]
+    );
+    assert_eq!(f.escrow(id).settled_units, 2);
+    assert_eq!(f.escrow(id).refund_due, 2_000_000);
+    for (ata, amount) in [
+        (f.treasury_ata, 1_400_000),
+        (f.artist_ata, 200_000),
+        (f.referrer_ata, 100_000),
+        (author_ata, 300_000),
+    ] {
+        assert_eq!(f.tokens(ata), amount);
+    }
+    let stored = f.svm.get_account(&f.pdas(id).0).unwrap();
+    rejects(
+        f.settle(id, 4),
+        code(enki_escrow::EscrowError::AlreadySettled),
+    );
+    assert_eq!(f.svm.get_account(&f.pdas(id).0).unwrap(), stored);
+    f.reclaim(id).unwrap();
+    assert_eq!(f.tokens(f.buyer_ata), BUYER_TOKENS - 2_000_000);
+    assert_eq!(f.tokens(author_ata), 300_000);
+    assert_eq!(f.tokens(f.referrer_ata), 100_000);
+}
+
+#[test]
+fn sparse_author_slot_settles_and_repeat_settlement_is_rejected() {
+    let mut f = Fixture::new();
+    f.init();
+    let id = [41; 16];
+    f.deposit_four(id, 2, [900_000, 0, 0, 100_000]);
+    let stored = f.escrow(id);
+    assert_eq!(stored.recipient_count, 4);
+    assert_eq!(stored.recipient_owners[1..3], [Pubkey::default(); 2]);
+    let ix = f.settle_ix(id, 2, f.operator.pubkey());
+    assert_eq!(ix.accounts.len(), SETTLE_RECIPIENT_OFFSET + 4);
+    assert_eq!(
+        ix.accounts[SETTLE_RECIPIENT_OFFSET + 1].pubkey,
+        Pubkey::default()
+    );
+    assert_eq!(
+        ix.accounts[SETTLE_RECIPIENT_OFFSET + 2].pubkey,
+        Pubkey::default()
+    );
+    f.send(ix, &[Role::Operator]).unwrap();
+    assert_eq!(f.tokens(f.treasury_ata), 1_800_000);
+    assert_eq!(f.tokens(Fixture::author_pdas(X_USER_ID).1), 200_000);
+    assert_eq!(f.escrow(id).paid_amounts, [1_800_000, 0, 0, 200_000]);
+    assert_eq!(f.escrow(id).refund_due, 0);
+    let settled = f.svm.get_account(&f.pdas(id).0).unwrap();
+    rejects(
+        f.settle(id, 2),
+        code(enki_escrow::EscrowError::AlreadySettled),
+    );
+    assert_eq!(f.svm.get_account(&f.pdas(id).0).unwrap(), settled);
+    assert_eq!(f.tokens(Fixture::author_pdas(X_USER_ID).1), 200_000);
+    f.reclaim(id).unwrap();
+}
+
+#[test]
+fn free_prompt_and_zero_rounded_slots_keep_their_fixed_positions() {
+    for (amounts, count) in [
+        ([950_000, 0, 25_000, 25_000], 4),
+        ([975_000, 0, 25_000, 0], 3),
+        ([99, 0, 0, 1], 4),
+        ([1, 0, 0, 0], 1),
+    ] {
+        let mut f = Fixture::new();
+        f.init();
+        let id = [42; 16];
+        f.deposit_four(id, 1, amounts);
+        let stored = f.escrow(id);
+        assert_eq!(stored.recipient_count, count);
+        assert_eq!(stored.recipient_owners, f.recipient_owners(amounts));
+        f.settle(id, 1).unwrap();
+        assert_eq!(f.escrow(id).paid_amounts, amounts);
+        assert_eq!(f.tokens(f.artist_ata), 0);
+        assert_eq!(f.tokens(f.referrer_ata), amounts[2]);
+        assert_eq!(f.tokens(Fixture::author_pdas(X_USER_ID).1), amounts[3]);
+        assert_eq!(f.escrow(id).refund_due, 0);
+        f.reclaim(id).unwrap();
+        assert_eq!(
+            f.tokens(f.buyer_ata),
+            BUYER_TOKENS - amounts.iter().sum::<u64>()
+        );
+    }
+}
+
+#[test]
+fn four_slot_deposit_rejects_owner_amount_mismatches_without_funding() {
+    for slot in 1..4 {
+        for positive_amount in [false, true] {
+            let mut f = Fixture::new();
+            f.init();
+            let id = [43; 16];
+            let mut amounts = [700_000, 100_000, 50_000, 150_000];
+            let mut owners = f.recipient_owners(amounts);
+            if positive_amount {
+                owners[slot] = Pubkey::default();
+            } else {
+                amounts[slot] = 0;
+            }
+            let ix = f.deposit_four_ix(id, 1, owners, amounts, NOW + 900);
+            rejects(
+                f.send(ix, &[Role::Buyer]),
+                code(enki_escrow::EscrowError::RecipientMismatch),
+            );
+            assert_eq!(f.tokens(f.buyer_ata), BUYER_TOKENS);
+            assert!(f
+                .svm
+                .get_account(&f.pdas(id).0)
+                .is_none_or(|a| a.lamports == 0));
+            assert!(f
+                .svm
+                .get_account(&f.pdas(id).1)
+                .is_none_or(|a| a.lamports == 0));
+        }
+    }
+}
+
+#[test]
+fn each_missing_or_unusable_optional_ata_only_forfeits_its_own_leg() {
+    for slot in 1..4 {
+        for change in std::iter::once(None).chain(UNUSABLE_ATAS.into_iter().map(Some)) {
+            let mut f = Fixture::new();
+            f.init();
+            let id = [44; 16];
+            let amounts = [700_000, 100_000, 50_000, 150_000];
+            let recipients = [
+                f.treasury_ata,
+                f.artist_ata,
+                f.referrer_ata,
+                Fixture::author_pdas(X_USER_ID).1,
+            ];
+            f.deposit_four(id, 4, amounts);
+            if let Some(change) = change {
+                f.change_ata(recipients[slot], change);
+            } else {
+                f.remove_ata(recipients[slot]);
+            }
+            let unusable = f.svm.get_account(&recipients[slot]);
+            f.settle(id, 4).unwrap();
+            let expected: [u64; 4] =
+                std::array::from_fn(|i| if i == slot { 0 } else { 4 * amounts[i] });
+            assert_eq!(
+                f.escrow(id).paid_amounts,
+                expected,
+                "slot {slot}, {change:?}"
+            );
+            assert_eq!(f.escrow(id).refund_due, 4 * amounts[slot]);
+            assert_eq!(f.tokens(f.pdas(id).1), 4 * amounts[slot]);
+            for i in 0..4 {
+                if i != slot {
+                    assert_eq!(f.tokens(recipients[i]), expected[i]);
+                }
+            }
+            if change.is_some() {
+                assert_eq!(f.svm.get_account(&recipients[slot]), unusable);
+            }
+            f.reclaim(id).unwrap();
+            assert_eq!(
+                f.tokens(f.buyer_ata),
+                BUYER_TOKENS - expected.iter().sum::<u64>()
+            );
+            assert_eq!(f.tokens(f.treasury_ata), 2_800_000);
+        }
+    }
+}
+
+#[test]
+fn multiple_unusable_optional_atas_preserve_the_other_payments_and_exact_refund() {
+    let mut f = Fixture::new();
+    f.init();
+    let id = [45; 16];
+    f.deposit_four(id, 4, [700_000, 100_000, 50_000, 150_000]);
+    f.remove_ata(f.artist_ata);
+    f.change_ata(f.referrer_ata, AtaChange::Frozen);
+    f.change_ata(
+        Fixture::author_pdas(X_USER_ID).1,
+        AtaChange::ReassignedOwner,
+    );
+    f.donate(id, 7);
+    f.settle(id, 2).unwrap();
+    assert_eq!(f.escrow(id).paid_amounts, [1_400_000, 0, 0, 0]);
+    assert_eq!(f.escrow(id).refund_due, 2_600_000);
+    assert_eq!(f.tokens(f.pdas(id).1), 2_600_007);
+    f.reclaim(id).unwrap();
+    assert_eq!(f.tokens(f.buyer_ata), BUYER_TOKENS - 1_400_000 - 7);
+    assert_eq!(f.tokens(f.treasury_ata), 1_400_007);
+}
+
+#[test]
+fn four_leg_dust_cannot_force_a_buyer_ata_check_after_full_payment() {
+    let mut f = Fixture::new();
+    f.init();
+    let id = [46; 16];
+    f.deposit_four(id, 1, [700_000, 100_000, 50_000, 150_000]);
+    f.settle(id, 1).unwrap();
+    f.donate(id, 1);
+    let reassign = spl_token::instruction::set_authority(
+        &token::ID,
+        &f.buyer_ata,
+        Some(&f.stranger.pubkey()),
+        spl_token::instruction::AuthorityType::AccountOwner,
+        &f.buyer.pubkey(),
+        &[],
+    )
+    .unwrap();
+    f.send_as_buyer(reassign).unwrap();
+    let buyer = f.svm.get_account(&f.buyer_ata).unwrap();
+    let (escrow, vault) = f.pdas(id);
+    assert_eq!(f.escrow(id).refund_due, 0);
+    assert_eq!(
+        f.escrow(id).paid_amounts,
+        [700_000, 100_000, 50_000, 150_000]
+    );
+    let rent = f.svm.get_balance(&escrow).unwrap() + f.svm.get_balance(&vault).unwrap();
+    let rent_payer_before = f.svm.get_balance(&f.payer.pubkey()).unwrap();
+    let ix = f.reclaim_ix(id, f.payer.pubkey(), false);
+    f.send_as_stranger(ix).unwrap();
+    assert_eq!(f.svm.get_account(&f.buyer_ata).unwrap(), buyer);
+    assert_eq!(f.tokens(f.treasury_ata), 700_001);
+    assert_eq!(
+        f.svm.get_balance(&f.payer.pubkey()).unwrap(),
+        rent_payer_before + rent
+    );
+    assert!(f.svm.get_account(&escrow).is_none_or(|a| a.lamports == 0));
+    assert!(f.svm.get_account(&vault).is_none_or(|a| a.lamports == 0));
+}
+
+#[test]
+fn settle_rejects_missing_reordered_noncanonical_and_writable_slot_metas() {
+    let mut f = Fixture::new();
+    f.init();
+    let id = [47; 16];
+    f.deposit_four(id, 1, [700_000, 100_000, 50_000, 150_000]);
+    let original = f.svm.get_account(&f.pdas(id).0).unwrap();
+    for kind in 0..4 {
+        let mut ix = f.settle_ix(id, 1, f.operator.pubkey());
+        match kind {
+            0 => {
+                ix.accounts.pop();
+            }
+            1 => ix
+                .accounts
+                .swap(SETTLE_RECIPIENT_OFFSET + 2, SETTLE_RECIPIENT_OFFSET + 3),
+            2 => ix.accounts[SETTLE_RECIPIENT_OFFSET + 2].pubkey = f.artist_ata,
+            _ => ix.accounts[SETTLE_RECIPIENT_OFFSET + 2].is_writable = false,
+        }
+        assert!(f.send(ix, &[Role::Operator]).is_err(), "case {kind}");
+        assert_eq!(f.svm.get_account(&f.pdas(id).0).unwrap(), original);
+        assert_eq!(f.tokens(f.pdas(id).1), 1_000_000);
+        assert_eq!(f.tokens(f.treasury_ata), 0);
+    }
+    f.settle(id, 1).unwrap();
+}
+
+#[test]
+fn sparse_zero_slot_requires_a_system_program_placeholder() {
+    let mut f = Fixture::new();
+    f.init();
+    let id = [48; 16];
+    f.deposit_four(id, 1, [900_000, 0, 0, 100_000]);
+    let mut ix = f.settle_ix(id, 1, f.operator.pubkey());
+    ix.accounts[SETTLE_RECIPIENT_OFFSET + 1].pubkey = f.artist_ata;
+    rejects(
+        f.send(ix, &[Role::Operator]),
+        code(enki_escrow::EscrowError::RecipientMismatch),
+    );
+    assert_eq!(f.escrow(id).paid_amounts, [0; 4]);
+    assert_eq!(f.tokens(f.pdas(id).1), 1_000_000);
+    f.settle(id, 1).unwrap();
+}
+
+#[test]
+fn after_author_claim_new_author_legs_pay_the_bound_wallet_directly() {
+    let mut f = Fixture::new();
+    f.init();
+    f.set_author_balance(X_USER_ID, 100_000);
+    let claimant = f.stranger.pubkey();
+    f.claim(X_USER_ID, claimant).unwrap();
+    let claimant_ata = get_associated_token_address(&claimant, &USDC_MINT);
+    assert_eq!(f.tokens(claimant_ata), 100_000);
+    let id = [49; 16];
+    let ix = f.deposit_four_ix(
+        id,
+        1,
+        [f.treasury, Pubkey::default(), Pubkey::default(), claimant],
+        [900_000, 0, 0, 100_000],
+        NOW + 900,
+    );
+    f.send(ix, &[Role::Buyer]).unwrap();
+    f.settle(id, 1).unwrap();
+    assert_eq!(f.escrow(id).paid_amounts, [900_000, 0, 0, 100_000]);
+    assert_eq!(f.tokens(claimant_ata), 200_000);
+    assert_eq!(f.tokens(Fixture::author_pdas(X_USER_ID).1), 0);
+    assert_eq!(f.author_claim(X_USER_ID).claimant, claimant);
+    f.reclaim(id).unwrap();
+}
+
+#[test]
+fn claim_binds_first_wallet_and_same_wallet_resweeps_fresh_funds() {
+    let mut f = Fixture::new();
+    f.init();
+    f.set_author_balance(X_USER_ID, 3_000_007);
+    let mut clock = f.svm.get_sysvar::<Clock>();
+    clock.slot = 12_345;
+    f.svm.set_sysvar(&clock);
+    let (author, author_ata, claim_address) = Fixture::author_pdas(X_USER_ID);
+    let buyer = f.buyer.pubkey();
+    let author_rent = f.svm.get_balance(&author_ata).unwrap();
+    let operator_before = f.svm.get_balance(&f.operator.pubkey()).unwrap();
+    f.claim(X_USER_ID, buyer).unwrap();
+    let claim = f.author_claim(X_USER_ID);
+    assert_eq!(claim.version, 1);
+    assert_eq!(claim.x_user_id, X_USER_ID);
+    assert_eq!(claim.claimant, buyer);
+    assert_eq!(claim.claimed_slot, clock.slot);
+    assert_eq!(
+        claim.bump,
+        Pubkey::find_program_address(&[b"claim", &X_USER_ID.to_le_bytes()], &ID).1
+    );
+    assert_eq!(f.svm.get_account(&claim_address).unwrap().data.len(), 58);
+    assert_eq!(f.tokens(author_ata), 0);
+    assert_eq!(f.tokens(f.buyer_ata), BUYER_TOKENS + 3_000_007);
+    assert_eq!(f.svm.get_balance(&author_ata).unwrap(), author_rent);
+    let claim_rent = f.svm.get_balance(&claim_address).unwrap();
+    assert_eq!(
+        f.svm.get_balance(&f.operator.pubkey()).unwrap(),
+        operator_before - claim_rent - 5_000
+    );
+    let binding = f.svm.get_account(&claim_address).unwrap().data;
+    f.claim(X_USER_ID, buyer).unwrap();
+    assert_eq!(f.tokens(f.buyer_ata), BUYER_TOKENS + 3_000_007);
+    assert_eq!(f.svm.get_account(&claim_address).unwrap().data, binding);
+    rejects(
+        f.claim(X_USER_ID, f.stranger.pubkey()),
+        code(enki_escrow::EscrowError::AlreadyClaimed),
+    );
+    let id = [50; 16];
+    f.deposit_four(id, 1, [900_000, 0, 0, 100_000]);
+    f.settle(id, 1).unwrap();
+    f.reclaim(id).unwrap();
+    let donation = spl_token::instruction::transfer_checked(
+        &token::ID,
+        &f.buyer_ata,
+        &USDC_MINT,
+        &author_ata,
+        &f.buyer.pubkey(),
+        &[],
+        7,
+        6,
+    )
+    .unwrap();
+    f.send_as_buyer(donation).unwrap();
+    assert_eq!(f.tokens(author_ata), 100_007);
+    let before_repeat = f.tokens(f.buyer_ata);
+    rejects(
+        f.claim(X_USER_ID, f.stranger.pubkey()),
+        code(enki_escrow::EscrowError::AlreadyClaimed),
+    );
+    assert_eq!(f.tokens(author_ata), 100_007);
+    assert_eq!(f.tokens(f.buyer_ata), before_repeat);
+    assert_eq!(f.svm.get_account(&claim_address).unwrap().data, binding);
+    f.claim(X_USER_ID, buyer).unwrap();
+    assert_eq!(f.tokens(f.buyer_ata), before_repeat + 100_007);
+    assert_eq!(f.tokens(author_ata), 0);
+    assert_eq!(f.svm.get_account(&claim_address).unwrap().data, binding);
+    assert_eq!(f.svm.get_balance(&author_ata).unwrap(), author_rent);
+    let token =
+        spl_token::state::Account::unpack(&f.svm.get_account(&author_ata).unwrap().data).unwrap();
+    assert_eq!(token.owner, author);
+}
+
+#[test]
+fn claim_requires_operator_signature_even_when_stranger_pays_transaction_fee() {
+    let mut f = Fixture::new();
+    f.init();
+    let claimant = f.buyer.pubkey();
+    // Both init_if_needed accounts already exist: no account-creation payer
+    // check can accidentally cover a weakened Signer constraint.
+    f.claim(X_USER_ID, claimant).unwrap();
+    f.set_author_balance(X_USER_ID, 123_456);
+    let (_, author_ata, claim_address) = Fixture::author_pdas(X_USER_ID);
+    let binding = f.svm.get_account(&claim_address).unwrap();
+    let buyer_before = f.tokens(f.buyer_ata);
+    let mut ix = f.claim_ix(X_USER_ID, claimant);
+    ix.accounts[1].is_signer = false;
+    rejects(f.send_as_stranger(ix), 3010);
+    assert_eq!(f.tokens(author_ata), 123_456);
+    assert_eq!(f.tokens(f.buyer_ata), buyer_before);
+    assert_eq!(f.svm.get_account(&claim_address).unwrap(), binding);
+    f.claim(X_USER_ID, claimant).unwrap();
+    assert_eq!(f.tokens(f.buyer_ata), buyer_before + 123_456);
+}
+
+#[test]
+fn claim_rejects_treasury_operator_and_default_claimants() {
+    for kind in 0..4 {
+        let mut f = Fixture::new();
+        f.init();
+        f.set_author_balance(X_USER_ID, 123_456);
+        let (author, author_ata, claim_address) = Fixture::author_pdas(X_USER_ID);
+        let claimant = match kind {
+            0 => f.treasury,
+            1 => f.operator.pubkey(),
+            2 => Pubkey::default(),
+            _ => author,
+        };
+        // Pre-create the canonical destination so only the handler's claimant
+        // restriction decides, including the system-program/default address.
+        let destination = get_associated_token_address(&claimant, &USDC_MINT);
+        if destination != author_ata {
+            f.set_tokens(
+                destination,
+                claimant,
+                0,
+                spl_token::state::AccountState::Initialized,
+            );
+        }
+        rejects(
+            f.claim(X_USER_ID, claimant),
+            code(enki_escrow::EscrowError::VaultToTreasury),
+        );
+        assert_eq!(f.tokens(author_ata), 123_456);
+        assert!(f
+            .svm
+            .get_account(&claim_address)
+            .is_none_or(|a| a.lamports == 0));
+        f.claim(X_USER_ID, f.buyer.pubkey()).unwrap();
+    }
+}
+
+#[test]
+fn claim_rejects_noncanonical_author_pda_and_token_accounts() {
+    for kind in 0..5 {
+        let mut f = Fixture::new();
+        f.init();
+        f.set_author_balance(X_USER_ID, 123_456);
+        let (author, author_ata, claim_address) = Fixture::author_pdas(X_USER_ID);
+        let mut ix = f.claim_ix(X_USER_ID, f.buyer.pubkey());
+        match kind {
+            0 => {
+                let wrong_author =
+                    Pubkey::find_program_address(&[b"author", &X_USER_ID.to_be_bytes()], &ID).0;
+                let wrong_ata = get_associated_token_address(&wrong_author, &USDC_MINT);
+                f.set_tokens(
+                    wrong_ata,
+                    wrong_author,
+                    123_456,
+                    spl_token::state::AccountState::Initialized,
+                );
+                ix.accounts[3].pubkey = wrong_author;
+                ix.accounts[4].pubkey = wrong_ata;
+            }
+            1 => {
+                ix.accounts[7].pubkey =
+                    Pubkey::find_program_address(&[b"claim", &X_USER_ID.to_be_bytes()], &ID).0;
+            }
+            2 => {
+                let noncanonical = Pubkey::new_unique();
+                // Correct SPL mint and PDA authority, deliberately wrong ATA
+                // address: this specifically kills a canonical-source mutant.
+                f.set_tokens(
+                    noncanonical,
+                    author,
+                    77,
+                    spl_token::state::AccountState::Initialized,
+                );
+                ix.accounts[4].pubkey = noncanonical;
+            }
+            3 => {
+                let noncanonical = Pubkey::new_unique();
+                f.set_tokens(
+                    noncanonical,
+                    f.buyer.pubkey(),
+                    0,
+                    spl_token::state::AccountState::Initialized,
+                );
+                ix.accounts[6].pubkey = noncanonical;
+            }
+            _ => {
+                ix.accounts[5].pubkey = f.stranger.pubkey();
+                let destination = get_associated_token_address(&f.stranger.pubkey(), &USDC_MINT);
+                f.set_tokens(
+                    destination,
+                    f.stranger.pubkey(),
+                    0,
+                    spl_token::state::AccountState::Initialized,
+                );
+                ix.accounts[6].pubkey = destination;
+            }
+        }
+        assert!(f.send(ix, &[Role::Operator]).is_err(), "case {kind}");
+        assert_eq!(f.tokens(author_ata), 123_456);
+        assert_eq!(f.tokens(f.buyer_ata), BUYER_TOKENS);
+        assert!(f
+            .svm
+            .get_account(&claim_address)
+            .is_none_or(|a| a.lamports == 0));
+        f.claim(X_USER_ID, f.buyer.pubkey()).unwrap();
+        assert_eq!(f.tokens(author_ata), 0);
+    }
+}
+
+#[test]
+fn claim_creates_missing_claimant_ata_at_operator_cost_without_closing_the_author_vault() {
+    let mut f = Fixture::new();
+    f.init();
+    f.set_author_balance(X_USER_ID, 987_654);
+    let claimant = f.stranger.pubkey();
+    let destination = get_associated_token_address(&claimant, &USDC_MINT);
+    let (_, author_ata, claim_address) = Fixture::author_pdas(X_USER_ID);
+    assert!(f
+        .svm
+        .get_account(&destination)
+        .is_none_or(|a| a.lamports == 0));
+    let operator_before = f.svm.get_balance(&f.operator.pubkey()).unwrap();
+    let claimant_before = f.svm.get_balance(&claimant).unwrap();
+    let source = f.svm.get_account(&author_ata).unwrap();
+    let claimed = f.claim(X_USER_ID, claimant).unwrap();
+    assert!(claimed.compute_units_consumed < 200_000);
+    println!(
+        "Author claim with ATA and binding creation consumed {} compute units",
+        claimed.compute_units_consumed
+    );
+    assert_eq!(f.tokens(destination), 987_654);
+    assert_eq!(f.tokens(author_ata), 0);
+    assert_eq!(f.svm.get_balance(&claimant).unwrap(), claimant_before);
+    let new_rent =
+        f.svm.get_balance(&destination).unwrap() + f.svm.get_balance(&claim_address).unwrap();
+    assert_eq!(
+        f.svm.get_balance(&f.operator.pubkey()).unwrap(),
+        operator_before - new_rent - 5_000
+    );
+    let after = f.svm.get_account(&author_ata).unwrap();
+    assert_eq!(after.owner, source.owner);
+    assert_eq!(after.lamports, source.lamports);
+    assert_eq!(after.data.len(), source.data.len());
+    assert_eq!(f.author_claim(X_USER_ID).claimant, claimant);
+}
+
+#[test]
+fn claim_uses_current_operator_and_is_available_while_paused_but_not_after_revoke() {
+    let mut f = Fixture::new();
+    f.init();
+    f.set_author_balance(X_USER_ID, 100);
+    f.send(f.emergency(f.guardian.pubkey(), false), &[Role::Guardian])
+        .unwrap();
+    f.claim(X_USER_ID, f.buyer.pubkey()).unwrap();
+    f.set_author_balance(X_USER_ID, 200);
+    f.send(f.emergency(f.guardian.pubkey(), true), &[Role::Guardian])
+        .unwrap();
+    rejects(
+        f.claim(X_USER_ID, f.buyer.pubkey()),
+        code(enki_escrow::EscrowError::Unauthorized),
+    );
+    assert_eq!(f.tokens(Fixture::author_pdas(X_USER_ID).1), 200);
+    let mut args = f.args();
+    args.operator = f.stranger.pubkey();
+    args.paused = true;
+    f.send(f.update_ix(f.admin.pubkey(), args), &[Role::Admin])
+        .unwrap();
+    rejects(
+        f.claim(X_USER_ID, f.buyer.pubkey()),
+        code(enki_escrow::EscrowError::Unauthorized),
+    );
+    let mut ix = f.claim_ix(X_USER_ID, f.buyer.pubkey());
+    ix.accounts[1].pubkey = f.stranger.pubkey();
+    f.send_as_stranger(ix).unwrap();
+    assert_eq!(f.tokens(Fixture::author_pdas(X_USER_ID).1), 0);
+    assert_eq!(f.tokens(f.buyer_ata), BUYER_TOKENS + 300);
+}
+
+#[test]
+fn claim_rejects_wrong_mint_and_unusable_source_or_destination_without_losing_funds() {
+    for source in [true, false] {
+        for change in UNUSABLE_ATAS {
+            let mut f = Fixture::new();
+            f.init();
+            f.set_author_balance(X_USER_ID, 123_456);
+            let (_, author_ata, claim_address) = Fixture::author_pdas(X_USER_ID);
+            let changed = if source { author_ata } else { f.buyer_ata };
+            let original = f.svm.get_account(&changed).unwrap();
+            f.change_ata(changed, change);
+            let before = f.svm.get_account(&changed).unwrap();
+            assert!(
+                f.claim(X_USER_ID, f.buyer.pubkey()).is_err(),
+                "{source}, {change:?}"
+            );
+            assert_eq!(f.svm.get_account(&changed).unwrap(), before);
+            assert!(f
+                .svm
+                .get_account(&claim_address)
+                .is_none_or(|a| a.lamports == 0));
+            f.svm.set_account(changed, original).unwrap();
+            f.claim(X_USER_ID, f.buyer.pubkey()).unwrap();
+            assert_eq!(f.tokens(author_ata), 0);
+            assert_eq!(f.tokens(f.buyer_ata), BUYER_TOKENS + 123_456);
+        }
+    }
+    let mut f = Fixture::new();
+    f.init();
+    f.set_author_balance(X_USER_ID, 123_456);
+    let fake_mint = Pubkey::new_unique();
+    f.svm
+        .set_account(fake_mint, f.svm.get_account(&USDC_MINT).unwrap())
+        .unwrap();
+    let mut ix = f.claim_ix(X_USER_ID, f.buyer.pubkey());
+    ix.accounts[2].pubkey = fake_mint;
+    rejects(
+        f.send(ix, &[Role::Operator]),
+        code(enki_escrow::EscrowError::WrongMint),
+    );
+    assert_eq!(f.tokens(Fixture::author_pdas(X_USER_ID).1), 123_456);
+    f.claim(X_USER_ID, f.buyer.pubkey()).unwrap();
+}
+
+#[test]
+fn author_claim_record_rejects_corrupt_version_bump_or_numeric_identity() {
+    for field in 0..3 {
+        let mut f = Fixture::new();
+        f.init();
+        let claimant = f.buyer.pubkey();
+        f.claim(X_USER_ID, claimant).unwrap();
+        f.set_author_balance(X_USER_ID, 123_456);
+        let (_, author_ata, claim_address) = Fixture::author_pdas(X_USER_ID);
+        let original = f.svm.get_account(&claim_address).unwrap();
+        let mut claim = f.author_claim(X_USER_ID);
+        match field {
+            0 => claim.version = 2,
+            1 => claim.bump = claim.bump.wrapping_add(1),
+            _ => claim.x_user_id = X_USER_ID + 1,
+        }
+        let mut corrupt = original.clone();
+        let mut data = Vec::new();
+        claim.try_serialize(&mut data).unwrap();
+        corrupt.data = data;
+        f.svm.set_account(claim_address, corrupt.clone()).unwrap();
+        rejects(
+            f.claim(X_USER_ID, claimant),
+            code(enki_escrow::EscrowError::WrongVersion),
+        );
+        assert_eq!(f.svm.get_account(&claim_address).unwrap(), corrupt);
+        assert_eq!(f.tokens(author_ata), 123_456);
+        assert_eq!(f.tokens(f.buyer_ata), BUYER_TOKENS);
+        f.svm.set_account(claim_address, original).unwrap();
+        f.claim(X_USER_ID, claimant).unwrap();
+        assert_eq!(f.tokens(author_ata), 0);
+    }
+}
+
+#[test]
+fn unusable_treasury_cannot_partially_pay_or_settle_a_four_recipient_order() {
+    for change in std::iter::once(None).chain(UNUSABLE_ATAS.into_iter().map(Some)) {
+        let mut f = Fixture::new();
+        f.init();
+        let id = [51; 16];
+        f.deposit_four(id, 1, [700_000, 100_000, 50_000, 150_000]);
+        let original_treasury = f.svm.get_account(&f.treasury_ata).unwrap();
+        let original_escrow = f.svm.get_account(&f.pdas(id).0).unwrap();
+        if let Some(change) = change {
+            f.change_ata(f.treasury_ata, change);
+        } else {
+            f.remove_ata(f.treasury_ata);
+        }
+        assert!(f.settle(id, 1).is_err(), "{change:?}");
+        assert_eq!(f.svm.get_account(&f.pdas(id).0).unwrap(), original_escrow);
+        assert_eq!(f.tokens(f.pdas(id).1), 1_000_000);
+        assert_eq!(f.tokens(f.artist_ata), 0);
+        assert_eq!(f.tokens(f.referrer_ata), 0);
+        assert_eq!(f.tokens(Fixture::author_pdas(X_USER_ID).1), 0);
+        f.svm
+            .set_account(f.treasury_ata, original_treasury)
+            .unwrap();
+        f.settle(id, 1).unwrap();
+        assert_eq!(
+            f.escrow(id).paid_amounts,
+            [700_000, 100_000, 50_000, 150_000]
+        );
+    }
+}
+
+#[test]
+fn claim_of_an_empty_author_vault_still_binds_the_first_wallet() {
+    let mut f = Fixture::new();
+    f.init();
+    let claimant = f.buyer.pubkey();
+    let (_, author_ata, claim_address) = Fixture::author_pdas(X_USER_ID);
+    f.claim(X_USER_ID, claimant).unwrap();
+    assert_eq!(f.tokens(author_ata), 0);
+    assert_eq!(f.author_claim(X_USER_ID).claimant, claimant);
+    let binding = f.svm.get_account(&claim_address).unwrap();
+    rejects(
+        f.claim(X_USER_ID, f.stranger.pubkey()),
+        code(enki_escrow::EscrowError::AlreadyClaimed),
+    );
+    f.claim(X_USER_ID, claimant).unwrap();
+    assert_eq!(f.svm.get_account(&claim_address).unwrap(), binding);
+    assert_eq!(f.tokens(f.buyer_ata), BUYER_TOKENS);
 }

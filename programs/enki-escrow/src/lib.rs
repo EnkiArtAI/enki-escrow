@@ -22,6 +22,8 @@ pub const MIN_TTL_S: i64 = 600;
 pub const MAX_TTL_S: i64 = 1_800;
 pub const MAX_REFUND_ATA_FEE_MICRO: u64 = 1_000_000;
 pub const USDC_DECIMALS: u8 = 6;
+pub const ESCROW_VERSION: u8 = 2;
+pub const RECIPIENT_SLOTS: usize = 4;
 
 #[program]
 pub mod enki_escrow {
@@ -57,8 +59,8 @@ pub mod enki_escrow {
         ctx: Context<Deposit>,
         intent_id: [u8; 16],
         units: u8,
-        recipient_owners: [Pubkey; 2],
-        unit_amounts: [u64; 2],
+        recipient_owners: [Pubkey; 4],
+        unit_amounts: [u64; 4],
         expires_at: i64,
     ) -> Result<()> {
         let config = &ctx.accounts.config;
@@ -68,8 +70,8 @@ pub mod enki_escrow {
             config.treasury_owner,
             EscrowError::WrongTreasury
         );
-        let recipient_count = validate_recipients(recipient_owners, unit_amounts)?;
         let amount = deposit_amount(units, unit_amounts, config.max_deposit_micro)?;
+        let recipient_count = validate_recipients(recipient_owners, unit_amounts)?;
         let created_at = Clock::get()?.unix_timestamp;
         validate_expiry(created_at, expires_at, config.min_ttl_s, config.max_ttl_s)?;
         require!(
@@ -91,7 +93,7 @@ pub mod enki_escrow {
             USDC_DECIMALS,
         )?;
         ctx.accounts.escrow.set_inner(Escrow {
-            version: 1,
+            version: ESCROW_VERSION,
             state: EscrowState::Funded,
             bump: ctx.bumps.escrow,
             vault_bump: ctx.bumps.vault,
@@ -107,6 +109,7 @@ pub mod enki_escrow {
             created_at,
             expires_at,
             refund_due: amount,
+            paid_amounts: [0; RECIPIENT_SLOTS],
         });
         emit!(Deposited {
             escrow: ctx.accounts.escrow.key(),
@@ -119,8 +122,9 @@ pub mod enki_escrow {
         Ok(())
     }
 
-    pub fn settle(ctx: Context<Settle>, k: u8) -> Result<()> {
+    pub fn settle<'info>(ctx: Context<'_, '_, '_, 'info, Settle<'info>>, k: u8) -> Result<()> {
         let escrow = &ctx.accounts.escrow;
+        require!(escrow.version == ESCROW_VERSION, EscrowError::WrongVersion);
         require!(
             escrow.state == EscrowState::Funded,
             EscrowError::AlreadySettled
@@ -130,24 +134,53 @@ pub mod enki_escrow {
             EscrowError::Expired
         );
         require!(k <= escrow.units, EscrowError::TooManyDeliveredUnits);
+        let count = validate_recipients(escrow.recipient_owners, escrow.unit_amounts)?;
+        require!(
+            count == escrow.recipient_count,
+            EscrowError::RecipientMismatch
+        );
+        require!(
+            ctx.remaining_accounts.len() == usize::from(count),
+            EscrowError::RecipientMismatch
+        );
         let treasury_paid = checked_product(k, escrow.unit_amounts[0])?;
-        let artist_due = checked_product(k, escrow.unit_amounts[1])?;
-        let artist_available = if artist_due == 0 {
-            false
-        } else {
-            // The account constraint enforces its address; unusable contents forfeit this leg.
-            canonical_token_status(
-                &ctx.accounts.artist_ata.to_account_info(),
-                escrow.recipient_owners[1],
-                escrow.mint,
-            )
-            .unwrap_or(TokenStatus::Frozen)
-                == TokenStatus::Ready
-        };
-        let artist_paid = if artist_available { artist_due } else { 0 };
-        let paid = treasury_paid
-            .checked_add(artist_paid)
-            .ok_or(EscrowError::Overflow)?;
+        let mut paid_amounts = [0; RECIPIENT_SLOTS];
+        paid_amounts[0] = treasury_paid;
+        for (i, recipient) in ctx.remaining_accounts.iter().enumerate() {
+            let owner = escrow.recipient_owners[i];
+            if escrow.unit_amounts[i] == 0 {
+                // Sparse slots retain their position, with the System Program as placeholder.
+                require_keys_eq!(
+                    *recipient.key,
+                    Pubkey::default(),
+                    EscrowError::RecipientMismatch
+                );
+                continue;
+            }
+            require_keys_eq!(
+                *recipient.key,
+                get_associated_token_address(&owner, &escrow.mint),
+                EscrowError::NonCanonicalAta
+            );
+            require!(recipient.is_writable, EscrowError::RecipientMismatch);
+            if i == 0 {
+                require!(
+                    canonical_token_status(recipient, owner, escrow.mint)? == TokenStatus::Ready,
+                    EscrowError::FrozenTreasuryAta
+                );
+            } else {
+                // An unusable recipient forfeits only its own leg, never the provider payment.
+                let available = canonical_token_status(recipient, owner, escrow.mint)
+                    .unwrap_or(TokenStatus::Frozen)
+                    == TokenStatus::Ready;
+                if available {
+                    paid_amounts[i] = checked_product(k, escrow.unit_amounts[i])?;
+                }
+            }
+        }
+        let paid = paid_amounts.iter().try_fold(0_u64, |total, amount| {
+            total.checked_add(*amount).ok_or(EscrowError::Overflow)
+        })?;
         let refund_due = escrow
             .refund_due
             .checked_sub(paid)
@@ -162,38 +195,33 @@ pub mod enki_escrow {
         let bump = [escrow.bump];
         let seeds: &[&[u8]] = &[b"escrow", buyer.as_ref(), &intent_id, &bump];
         let signer = &[seeds];
-        transfer_from_vault(
-            ctx.accounts.token_program.to_account_info(),
-            ctx.accounts.vault.to_account_info(),
-            ctx.accounts.mint.to_account_info(),
-            ctx.accounts.treasury_ata.to_account_info(),
-            ctx.accounts.escrow.to_account_info(),
-            signer,
-            treasury_paid,
-        )?;
-        transfer_from_vault(
-            ctx.accounts.token_program.to_account_info(),
-            ctx.accounts.vault.to_account_info(),
-            ctx.accounts.mint.to_account_info(),
-            ctx.accounts.artist_ata.to_account_info(),
-            ctx.accounts.escrow.to_account_info(),
-            signer,
-            artist_paid,
-        )?;
+        for (recipient, amount) in ctx.remaining_accounts.iter().zip(paid_amounts) {
+            transfer_from_vault(
+                ctx.accounts.token_program.to_account_info(),
+                ctx.accounts.vault.to_account_info(),
+                ctx.accounts.mint.to_account_info(),
+                recipient.clone(),
+                ctx.accounts.escrow.to_account_info(),
+                signer,
+                amount,
+            )?;
+        }
         let escrow = &mut ctx.accounts.escrow;
         escrow.state = EscrowState::Settled;
         escrow.settled_units = k;
         escrow.refund_due = refund_due;
+        escrow.paid_amounts = paid_amounts;
         emit!(Settled {
             escrow: escrow.key(),
             k,
-            paid: [treasury_paid, artist_paid]
+            paid: paid_amounts
         });
         Ok(())
     }
 
     pub fn reclaim(ctx: Context<Reclaim>) -> Result<()> {
         let escrow = &ctx.accounts.escrow;
+        require!(escrow.version == ESCROW_VERSION, EscrowError::WrongVersion);
         require!(
             escrow.state == EscrowState::Settled
                 || Clock::get()?.unix_timestamp >= escrow.expires_at,
@@ -281,6 +309,58 @@ pub mod enki_escrow {
         });
         Ok(())
     }
+
+    pub fn claim_author_vault(
+        ctx: Context<ClaimAuthorVault>,
+        x_user_id: u64,
+        claimant: Pubkey,
+    ) -> Result<()> {
+        require!(
+            claimant != ctx.accounts.config.treasury_owner
+                && claimant != ctx.accounts.config.operator
+                && claimant != Pubkey::default()
+                && claimant != ctx.accounts.author.key(),
+            EscrowError::VaultToTreasury
+        );
+        let claim = &mut ctx.accounts.author_claim;
+        if claim.claimant == Pubkey::default() {
+            // This record has no close or rebind instruction. init_if_needed may only
+            // initialize the empty record; subsequent calls preserve the first wallet.
+            claim.version = 1;
+            claim.bump = ctx.bumps.author_claim;
+            claim.x_user_id = x_user_id;
+            claim.claimant = claimant;
+            claim.claimed_slot = Clock::get()?.slot;
+        } else {
+            require!(
+                claim.version == 1
+                    && claim.bump == ctx.bumps.author_claim
+                    && claim.x_user_id == x_user_id,
+                EscrowError::WrongVersion
+            );
+            require_keys_eq!(claim.claimant, claimant, EscrowError::AlreadyClaimed);
+        }
+        let amount = ctx.accounts.author_ata.amount;
+        let id_bytes = x_user_id.to_le_bytes();
+        let bump = [ctx.bumps.author];
+        let seeds: &[&[u8]] = &[b"author", &id_bytes, &bump];
+        transfer_from_vault(
+            ctx.accounts.token_program.to_account_info(),
+            ctx.accounts.author_ata.to_account_info(),
+            ctx.accounts.mint.to_account_info(),
+            ctx.accounts.claimant_ata.to_account_info(),
+            ctx.accounts.author.to_account_info(),
+            &[seeds],
+            amount,
+        )?;
+        emit!(AuthorVaultClaimed {
+            x_user_id,
+            author: ctx.accounts.author.key(),
+            claimant,
+            amount,
+        });
+        Ok(())
+    }
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone)]
@@ -361,13 +441,24 @@ pub struct Escrow {
     pub mint: Pubkey,
     pub rent_payer: Pubkey,
     pub recipient_count: u8,
-    pub recipient_owners: [Pubkey; 2],
-    pub unit_amounts: [u64; 2],
+    pub recipient_owners: [Pubkey; 4],
+    pub unit_amounts: [u64; 4],
     pub units: u8,
     pub settled_units: u8,
     pub created_at: i64,
     pub expires_at: i64,
     pub refund_due: u64,
+    pub paid_amounts: [u64; 4],
+}
+
+#[account]
+#[derive(InitSpace)]
+pub struct AuthorClaim {
+    pub version: u8,
+    pub bump: u8,
+    pub x_user_id: u64,
+    pub claimant: Pubkey,
+    pub claimed_slot: u64,
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq, InitSpace)]
@@ -438,12 +529,33 @@ pub struct Settle<'info> {
     pub vault: Account<'info, TokenAccount>,
     #[account(address = USDC_MINT @ EscrowError::WrongMint, mint::decimals = USDC_DECIMALS)]
     pub mint: Account<'info, Mint>,
-    #[account(mut, constraint = treasury_ata.key() == get_associated_token_address(&escrow.recipient_owners[0], &escrow.mint) @ EscrowError::NonCanonicalAta, token::mint = mint, constraint = treasury_ata.owner == escrow.recipient_owners[0] @ EscrowError::WrongTokenOwner)]
-    pub treasury_ata: Account<'info, TokenAccount>,
-    /// CHECK: canonical address is constrained; owner, mint and state are checked before any CPI.
-    #[account(mut, constraint = artist_ata.key() == get_associated_token_address(&escrow.recipient_owners[1], &escrow.mint) @ EscrowError::NonCanonicalAta)]
-    pub artist_ata: UncheckedAccount<'info>,
     pub token_program: Program<'info, Token>,
+}
+
+#[derive(Accounts)]
+#[instruction(x_user_id: u64, claimant: Pubkey)]
+pub struct ClaimAuthorVault<'info> {
+    #[account(seeds = [b"config"], bump = config.bump, has_one = operator @ EscrowError::Unauthorized)]
+    pub config: Account<'info, Config>,
+    #[account(mut)]
+    pub operator: Signer<'info>,
+    #[account(address = USDC_MINT @ EscrowError::WrongMint, mint::decimals = USDC_DECIMALS)]
+    pub mint: Account<'info, Mint>,
+    /// CHECK: PDA seeds bind the token authority; the PDA never stores an account balance ledger.
+    #[account(seeds = [b"author", &x_user_id.to_le_bytes()], bump)]
+    pub author: UncheckedAccount<'info>,
+    #[account(mut, associated_token::mint = mint, associated_token::authority = author, associated_token::token_program = token_program)]
+    pub author_ata: Account<'info, TokenAccount>,
+    /// CHECK: the operator attests this argument; ATA constraints enforce the same beneficiary.
+    #[account(address = claimant @ EscrowError::RecipientMismatch)]
+    pub claimant_wallet: UncheckedAccount<'info>,
+    #[account(init_if_needed, payer = operator, associated_token::mint = mint, associated_token::authority = claimant_wallet, associated_token::token_program = token_program)]
+    pub claimant_ata: Account<'info, TokenAccount>,
+    #[account(init_if_needed, payer = operator, space = 8 + AuthorClaim::INIT_SPACE, seeds = [b"claim", &x_user_id.to_le_bytes()], bump)]
+    pub author_claim: Account<'info, AuthorClaim>,
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
@@ -473,20 +585,22 @@ pub struct Reclaim<'info> {
     pub system_program: Program<'info, System>,
 }
 
-fn validate_recipients(owners: [Pubkey; 2], amounts: [u64; 2]) -> Result<u8> {
-    if amounts[1] == 0 {
+fn validate_recipients(
+    owners: [Pubkey; RECIPIENT_SLOTS],
+    amounts: [u64; RECIPIENT_SLOTS],
+) -> Result<u8> {
+    let mut count = 0;
+    for i in 0..RECIPIENT_SLOTS {
         require!(
-            owners[1] == Pubkey::default(),
-            EscrowError::InvalidRecipient
+            (owners[i] == Pubkey::default()) == (amounts[i] == 0),
+            EscrowError::RecipientMismatch
         );
-        Ok(1)
-    } else {
-        require!(
-            owners[1] != Pubkey::default(),
-            EscrowError::InvalidRecipient
-        );
-        Ok(2)
+        if amounts[i] != 0 {
+            count = (i + 1) as u8;
+        }
     }
+    require!(amounts[0] != 0, EscrowError::RecipientMismatch);
+    Ok(count)
 }
 
 fn checked_product(units: u8, amount: u64) -> Result<u64> {
@@ -495,11 +609,11 @@ fn checked_product(units: u8, amount: u64) -> Result<u64> {
         .ok_or_else(|| error!(EscrowError::Overflow))
 }
 
-fn deposit_amount(units: u8, amounts: [u64; 2], cap: u64) -> Result<u64> {
+fn deposit_amount<const N: usize>(units: u8, amounts: [u64; N], cap: u64) -> Result<u64> {
     require!(units > 0 && units <= MAX_UNITS, EscrowError::InvalidUnits);
-    let per_unit = amounts[0]
-        .checked_add(amounts[1])
-        .ok_or(EscrowError::Overflow)?;
+    let per_unit = amounts.iter().try_fold(0_u64, |total, amount| {
+        total.checked_add(*amount).ok_or(EscrowError::Overflow)
+    })?;
     require!(per_unit > 0, EscrowError::ZeroAmount);
     let total = checked_product(units, per_unit)?;
     require!(total <= cap, EscrowError::DepositCap);
@@ -595,7 +709,15 @@ pub struct Deposited {
 pub struct Settled {
     pub escrow: Pubkey,
     pub k: u8,
-    pub paid: [u64; 2],
+    pub paid: [u64; 4],
+}
+
+#[event]
+pub struct AuthorVaultClaimed {
+    pub x_user_id: u64,
+    pub author: Pubkey,
+    pub claimant: Pubkey,
+    pub amount: u64,
 }
 
 #[event]
@@ -659,6 +781,16 @@ pub enum EscrowError {
     RentPayerMustSign,
     #[msg("Rent must return to the original rent payer.")]
     WrongRentPayer,
+    #[msg("A recipient slot does not match its amount or token account.")]
+    RecipientMismatch,
+    #[msg("The escrow account version is unsupported.")]
+    WrongVersion,
+    #[msg("The treasury token account is frozen.")]
+    FrozenTreasuryAta,
+    #[msg("An author vault cannot pay the treasury, operator or an invalid beneficiary.")]
+    VaultToTreasury,
+    #[msg("This author is already bound to another payout wallet.")]
+    AlreadyClaimed,
 }
 
 #[cfg(test)]
@@ -668,7 +800,8 @@ mod tests {
     #[test]
     fn account_layout_matches_ticket() {
         assert_eq!(8 + Config::INIT_SPACE, 170);
-        assert_eq!(8 + Escrow::INIT_SPACE, 231);
+        assert_eq!(8 + Escrow::INIT_SPACE, 343);
+        assert_eq!(8 + AuthorClaim::INIT_SPACE, 58);
     }
 
     #[test]
@@ -692,6 +825,34 @@ mod tests {
             deposit_amount(24, [900_000, 100_000], config_cap).unwrap(),
             24_000_000
         );
+        assert_eq!(
+            deposit_amount(4, [1_000_000, 200_000, 25_000, 25_000], config_cap).unwrap(),
+            5_000_000
+        );
+        assert!(deposit_amount(1, [u64::MAX - 2, 1, 1, 1], u64::MAX).is_err());
+    }
+
+    #[test]
+    fn recipient_span_preserves_free_and_claimed_sparse_slots() {
+        let treasury = Pubkey::new_unique();
+        let referrer = Pubkey::new_unique();
+        let author = Pubkey::new_unique();
+        let empty = Pubkey::default();
+        assert_eq!(
+            validate_recipients([treasury, empty, empty, empty], [1, 0, 0, 0]).unwrap(),
+            1
+        );
+        assert_eq!(
+            validate_recipients([treasury, empty, referrer, author], [100, 0, 25, 25]).unwrap(),
+            4
+        );
+        assert_eq!(
+            validate_recipients([treasury, empty, empty, author], [100, 0, 0, 50]).unwrap(),
+            4
+        );
+        assert!(validate_recipients([treasury, empty, referrer, empty], [100, 0, 0, 0]).is_err());
+        assert!(validate_recipients([treasury, empty, empty, empty], [100, 0, 25, 0]).is_err());
+        assert!(validate_recipients([empty; 4], [0; 4]).is_err());
     }
 
     #[test]

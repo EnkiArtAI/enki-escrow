@@ -20,7 +20,7 @@ no-log-ix-name = []
 idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
 
 [dependencies]
-anchor-lang = "=0.32.1"
+anchor-lang = { version = "=0.32.1", features = ["init-if-needed"] }
 # Anchor 0.32 calls AccountInfo::resize, introduced in Solana's 2.3 account API.
 solana-account-info = "=2.3.0"
 # Anchor's account-init macro references token_2022 helpers even for typed classic Token accounts.

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Prove payment regression tests reject faulty SBF programs, without RPC."""
 
+import argparse
 import os
 from pathlib import Path
 import re
@@ -11,7 +12,9 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "programs/enki-escrow/src/lib.rs"
 BINARY = ROOT / "target/deploy/enki_escrow.so"
+TESTS = ROOT / "programs/enki-escrow/tests/escrow.rs"
 PARTIAL = "partial_delivery_pays_exact_units_refunds_rest_and_returns_rent"
+SPARSE = "sparse_author_slot_settles_and_repeat_settlement_is_rejected"
 MUTATIONS = (
     (
         "unusable-artist-blocks-treasury",
@@ -73,8 +76,82 @@ MUTATIONS = (
         b"(remaining, fee, true)",
         "missing_buyer_ata_fee_rules_are_exact_and_rent_destination_cannot_change",
     ),
+    (
+        "unsigned-claim-operator",
+        b"pub operator: Signer<'info>,",
+        b"/// CHECK: deliberately remove the claim signature requirement.\n    pub operator: UncheckedAccount<'info>,",
+        "claim_requires_operator_signature_even_when_stranger_pays_transaction_fee",
+    ),
+    (
+        "claim-allows-forbidden-beneficiary",
+        b"claimant != ctx.accounts.config.treasury_owner\n"
+        b"                && claimant != ctx.accounts.config.operator\n"
+        b"                && claimant != Pubkey::default()\n"
+        b"                && claimant != ctx.accounts.author.key()",
+        b"true",
+        "claim_rejects_treasury_operator_and_default_claimants",
+    ),
+    (
+        "claim-rebinds-first-wallet",
+        b"require_keys_eq!(claim.claimant, claimant, EscrowError::AlreadyClaimed);",
+        b"let _ = claimant;",
+        "claim_binds_first_wallet_and_same_wallet_resweeps_fresh_funds",
+    ),
+    (
+        "claim-allows-noncanonical-author-ata",
+        b"#[account(mut, associated_token::mint = mint, associated_token::authority = author, associated_token::token_program = token_program)]",
+        b"#[account(mut, token::mint = mint, token::authority = author, token::token_program = token_program)]",
+        "claim_rejects_noncanonical_author_pda_and_token_accounts",
+    ),
+    (
+        "settlement-loses-sparse-author-leg",
+        b"paid_amounts[i] = checked_product(k, escrow.unit_amounts[i])?;",
+        b"if i != 3 { paid_amounts[i] = checked_product(k, escrow.unit_amounts[i])?; }",
+        SPARSE,
+    ),
+    (
+        "repeat-sparse-settlement",
+        b"escrow.state == EscrowState::Funded",
+        b"true",
+        SPARSE,
+    ),
 )
+SCOPES = {
+    "unsigned-settlement-operator": b"pub struct Settle<'info> {",
+    "unsigned-claim-operator": b"pub struct ClaimAuthorVault<'info> {",
+}
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def mutated_source(original, name, needle, replacement):
+    """Require one exact target, scoped when account structs share a field."""
+    marker = SCOPES.get(name)
+    start, end = 0, len(original)
+    if marker is not None:
+        if original.count(marker) != 1:
+            raise RuntimeError(f"{name}: expected exactly one mutation scope")
+        start = original.index(marker)
+        closing = original.find(b"\n}", start)
+        if closing == -1:
+            raise RuntimeError(f"{name}: mutation scope has no closing brace")
+        end = closing + len(b"\n}")
+    selected = original[start:end]
+    if selected.count(needle) != 1:
+        raise RuntimeError(f"{name}: expected exactly one mutation target")
+    if needle == replacement:
+        raise RuntimeError(f"{name}: mutation must change the source")
+    return original[:start] + selected.replace(needle, replacement, 1) + original[end:]
+
+
+def check_inventory(original, test_source):
+    names = [name for name, _, _, _ in MUTATIONS]
+    if len(names) != len(set(names)):
+        raise RuntimeError("Mutation names must be unique")
+    for name, needle, replacement, test in MUTATIONS:
+        mutated_source(original, name, needle, replacement)
+        selector = re.compile(rf"(?m)^fn {re.escape(test)}\(")
+        if len(selector.findall(test_source)) != 1:
+            raise RuntimeError(f"{name}: expected exactly one VM test named {test}")
 
 
 def run(command, env, log, timeout):
@@ -93,9 +170,19 @@ def run(command, env, log, timeout):
 
 
 def main():
-    if sys.platform != "linux":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--check", action="store_true",
+        help="Check mutation targets and VM test selectors without building or running Rust.",
+    )
+    args = parser.parse_args()
+    if not args.check and sys.platform != "linux":
         raise RuntimeError("Run mutation checks on the Linux CI runner.")
     original_source = SOURCE.read_bytes()
+    check_inventory(original_source, TESTS.read_text(encoding="utf-8"))
+    if args.check:
+        print(f"Mutation inventory: {len(MUTATIONS)} exact targets and VM test selectors; no Rust executed.")
+        return
     original_binary = BINARY.read_bytes()
     host_env = os.environ.copy()
     build_env = host_env.copy()
@@ -107,9 +194,7 @@ def main():
     logs.mkdir(parents=True, exist_ok=True)
     try:
         for name, needle, replacement, test in MUTATIONS:
-            if original_source.count(needle) != 1:
-                raise RuntimeError(f"{name}: expected exactly one mutation target")
-            SOURCE.write_bytes(original_source.replace(needle, replacement, 1))
+            SOURCE.write_bytes(mutated_source(original_source, name, needle, replacement))
             status, output = run(
                 [
                     "cargo", "build-sbf", "--skip-tools-install",
