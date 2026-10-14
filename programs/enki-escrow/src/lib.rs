@@ -324,6 +324,10 @@ pub mod enki_escrow {
         );
         let claim = &mut ctx.accounts.author_claim;
         if claim.claimant == Pubkey::default() {
+            require!(
+                ctx.accounts.claimant_wallet.is_signer,
+                EscrowError::ClaimantMustSign
+            );
             // This record has no close or rebind instruction. init_if_needed may only
             // initialize the empty record; subsequent calls preserve the first wallet.
             claim.version = 1;
@@ -546,7 +550,8 @@ pub struct ClaimAuthorVault<'info> {
     pub author: UncheckedAccount<'info>,
     #[account(mut, associated_token::mint = mint, associated_token::authority = author, associated_token::token_program = token_program)]
     pub author_ata: Account<'info, TokenAccount>,
-    /// CHECK: the operator attests this argument; ATA constraints enforce the same beneficiary.
+    /// CHECK: address and ATA constraints bind the beneficiary. The first claim also
+    /// requires its signature in the handler; later sweeps retain the recorded wallet.
     #[account(address = claimant @ EscrowError::RecipientMismatch)]
     pub claimant_wallet: UncheckedAccount<'info>,
     #[account(init_if_needed, payer = operator, associated_token::mint = mint, associated_token::authority = claimant_wallet, associated_token::token_program = token_program)]
@@ -791,6 +796,8 @@ pub enum EscrowError {
     VaultToTreasury,
     #[msg("This author is already bound to another payout wallet.")]
     AlreadyClaimed,
+    #[msg("The payout wallet must sign its first author claim.")]
+    ClaimantMustSign,
 }
 
 #[cfg(test)]

@@ -67,6 +67,15 @@ signature as the attestation that the claimant owns that X account. It transfers
 the vault ATA's whole balance to the claimant's canonical USDC ATA; there is no
 operator-selected withdrawal amount, balance ledger or vault closure.
 
+The first claim additionally requires the claimant wallet's signature before
+the permanent binding is written, including when the vault is empty. A missing
+signature returns `ClaimantMustSign`. Subsequent sweeps to the already-bound
+wallet require only the current operator's signature. The wallet account stays
+unchecked in the generated interface because its signature requirement is
+conditional: the client must mark `claimant_wallet` as a readonly signer and
+collect that wallet's signature for a first claim. Account order and sizes are
+unchanged.
+
 The first successful claim creates a 58-byte `AuthorClaim` account at seeds
 `["claim", x_user_id]`: discriminator, version, bump, X user ID, claimant wallet
 and claimed slot. That wallet binding is immutable, including after operator
@@ -110,7 +119,7 @@ programs and requires the selected VM regression tests to fail. It retains the
 ten v1 mutations for recipient failures, signer binding, refund/donation rules,
 initialization, deposit caps, repeat settlement and delivered-unit accounting.
 The v2 mutations cover the claim operator signature, forbidden claimants,
-immutable claimant binding, canonical author-vault accounts and the sparse
+first-claim wallet signature, immutable claimant binding, canonical author-vault accounts and the sparse
 author leg. `scripts/check-mutations.py` restores the original source and SBF
 binary in a `finally` block. A compilation failure does not count as mutation
 proof. The following command checks mutation targets and exact test selectors

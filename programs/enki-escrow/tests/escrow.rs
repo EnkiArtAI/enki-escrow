@@ -499,7 +499,30 @@ impl Fixture {
     }
 
     fn claim(&mut self, x_user_id: u64, claimant: Pubkey) -> TransactionResult {
-        self.send(self.claim_ix(x_user_id, claimant), &[Role::Operator])
+        let mut ix = self.claim_ix(x_user_id, claimant);
+        let first_claim = self
+            .svm
+            .get_account(&Self::author_pdas(x_user_id).2)
+            .is_none_or(|account| account.lamports == 0 || account.data.is_empty());
+        let mut roles = vec![Role::Operator];
+        if first_claim {
+            let beneficiary_role = if claimant == self.buyer.pubkey() {
+                Some(Role::Buyer)
+            } else if claimant == self.stranger.pubkey() {
+                Some(Role::Stranger)
+            } else if claimant == self.operator.pubkey() {
+                Some(Role::Operator)
+            } else {
+                // Unknown fixture keys are only used for the forbidden
+                // treasury/default/author-PDA cases, rejected before binding.
+                None
+            };
+            if let Some(role) = beneficiary_role {
+                ix.accounts[5].is_signer = true;
+                roles.push(role);
+            }
+        }
+        self.send(ix, &roles)
     }
 
     fn set_data(&mut self, key: Pubkey, data: Vec<u8>, owner: Pubkey) {
@@ -1788,7 +1811,7 @@ fn claim_binds_first_wallet_and_same_wallet_resweeps_fresh_funds() {
     let claim_rent = f.svm.get_balance(&claim_address).unwrap();
     assert_eq!(
         f.svm.get_balance(&f.operator.pubkey()).unwrap(),
-        operator_before - claim_rent - 5_000
+        operator_before - claim_rent - 10_000
     );
     let binding = f.svm.get_account(&claim_address).unwrap().data;
     f.claim(X_USER_ID, buyer).unwrap();
@@ -1863,8 +1886,8 @@ fn claim_rejects_treasury_operator_and_default_claimants() {
         f.set_author_balance(X_USER_ID, 123_456);
         let (author, author_ata, claim_address) = Fixture::author_pdas(X_USER_ID);
         let claimant = match kind {
-            0 => f.treasury,
-            1 => f.operator.pubkey(),
+            0 => f.operator.pubkey(),
+            1 => f.treasury,
             2 => Pubkey::default(),
             _ => author,
         };
@@ -1900,6 +1923,7 @@ fn claim_rejects_noncanonical_author_pda_and_token_accounts() {
         f.set_author_balance(X_USER_ID, 123_456);
         let (author, author_ata, claim_address) = Fixture::author_pdas(X_USER_ID);
         let mut ix = f.claim_ix(X_USER_ID, f.buyer.pubkey());
+        ix.accounts[5].is_signer = true;
         match kind {
             0 => {
                 let wrong_author =
@@ -1942,6 +1966,9 @@ fn claim_rejects_noncanonical_author_pda_and_token_accounts() {
             }
             _ => {
                 ix.accounts[5].pubkey = f.stranger.pubkey();
+                // This is an address-mismatch test, so the substituted wallet
+                // must not make transaction signing fail before Anchor runs.
+                ix.accounts[5].is_signer = false;
                 let destination = get_associated_token_address(&f.stranger.pubkey(), &USDC_MINT);
                 f.set_tokens(
                     destination,
@@ -1952,7 +1979,12 @@ fn claim_rejects_noncanonical_author_pda_and_token_accounts() {
                 ix.accounts[6].pubkey = destination;
             }
         }
-        assert!(f.send(ix, &[Role::Operator]).is_err(), "case {kind}");
+        let roles = if kind == 4 {
+            vec![Role::Operator]
+        } else {
+            vec![Role::Operator, Role::Buyer]
+        };
+        assert!(f.send(ix, &roles).is_err(), "case {kind}");
         assert_eq!(f.tokens(author_ata), 123_456);
         assert_eq!(f.tokens(f.buyer_ata), BUYER_TOKENS);
         assert!(f
@@ -1992,7 +2024,7 @@ fn claim_creates_missing_claimant_ata_at_operator_cost_without_closing_the_autho
         f.svm.get_balance(&destination).unwrap() + f.svm.get_balance(&claim_address).unwrap();
     assert_eq!(
         f.svm.get_balance(&f.operator.pubkey()).unwrap(),
-        operator_before - new_rent - 5_000
+        operator_before - new_rent - 10_000
     );
     let after = f.svm.get_account(&author_ata).unwrap();
     assert_eq!(after.owner, source.owner);
@@ -2093,9 +2125,10 @@ fn claim_rejects_wrong_mint_and_unusable_source_or_destination_without_losing_fu
     let mut ix = f.claim_ix(X_USER_ID, f.buyer.pubkey());
     ix.accounts[2].pubkey = fake_mint;
     ix.accounts[4].pubkey = fake_source;
+    ix.accounts[5].is_signer = true;
     ix.accounts[6].pubkey = fake_destination;
     rejects(
-        f.send(ix, &[Role::Operator]),
+        f.send(ix, &[Role::Operator, Role::Buyer]),
         code(enki_escrow::EscrowError::WrongMint),
     );
     for (key, account) in unchanged_accounts {
@@ -2192,4 +2225,52 @@ fn claim_of_an_empty_author_vault_still_binds_the_first_wallet() {
     f.claim(X_USER_ID, claimant).unwrap();
     assert_eq!(f.svm.get_account(&claim_address).unwrap(), binding);
     assert_eq!(f.tokens(f.buyer_ata), BUYER_TOKENS);
+}
+
+#[test]
+fn first_author_claim_requires_claimant_signature_and_later_sweeps_do_not() {
+    for initial_balance in [0, 123_456] {
+        let mut f = Fixture::new();
+        f.init();
+        f.set_author_balance(X_USER_ID, initial_balance);
+        let claimant = f.buyer.pubkey();
+        let (_, author_ata, claim_address) = Fixture::author_pdas(X_USER_ID);
+        // The claimant ATA is already present; the operator signs and pays.
+        // Only the permanent beneficiary binding lacks its owner's signature.
+        let source_before = f.svm.get_account(&author_ata).unwrap();
+        let claimant_before = f.svm.get_account(&f.buyer_ata).unwrap();
+        let unsigned = f.claim_ix(X_USER_ID, claimant);
+        assert!(unsigned.accounts[1].is_signer);
+        assert!(!unsigned.accounts[5].is_signer);
+        rejects(
+            f.send(unsigned, &[Role::Operator]),
+            code(enki_escrow::EscrowError::ClaimantMustSign),
+        );
+        assert_eq!(f.svm.get_account(&author_ata).unwrap(), source_before);
+        assert_eq!(f.svm.get_account(&f.buyer_ata).unwrap(), claimant_before);
+        assert!(f
+            .svm
+            .get_account(&claim_address)
+            .is_none_or(|account| account.lamports == 0));
+
+        let mut signed = f.claim_ix(X_USER_ID, claimant);
+        signed.accounts[5].is_signer = true;
+        f.send(signed, &[Role::Operator, Role::Buyer]).unwrap();
+        assert_eq!(f.author_claim(X_USER_ID).claimant, claimant);
+        assert_eq!(f.tokens(author_ata), 0);
+        assert_eq!(f.tokens(f.buyer_ata), BUYER_TOKENS + initial_balance);
+        let permanent_binding = f.svm.get_account(&claim_address).unwrap();
+
+        f.set_author_balance(X_USER_ID, 17);
+        let unsigned_repeat = f.claim_ix(X_USER_ID, claimant);
+        assert!(unsigned_repeat.accounts[1].is_signer);
+        assert!(!unsigned_repeat.accounts[5].is_signer);
+        f.send(unsigned_repeat, &[Role::Operator]).unwrap();
+        assert_eq!(f.tokens(author_ata), 0);
+        assert_eq!(f.tokens(f.buyer_ata), BUYER_TOKENS + initial_balance + 17);
+        assert_eq!(
+            f.svm.get_account(&claim_address).unwrap(),
+            permanent_binding
+        );
+    }
 }

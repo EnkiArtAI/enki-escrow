@@ -83,6 +83,12 @@ MUTATIONS = (
         "claim_requires_operator_signature_even_when_stranger_pays_transaction_fee",
     ),
     (
+        "unsigned-first-claimant",
+        b"ctx.accounts.claimant_wallet.is_signer,",
+        b"true,",
+        "first_author_claim_requires_claimant_signature_and_later_sweeps_do_not",
+    ),
+    (
         "claim-allows-forbidden-beneficiary",
         b"claimant != ctx.accounts.config.treasury_owner\n"
         b"                && claimant != ctx.accounts.config.operator\n"

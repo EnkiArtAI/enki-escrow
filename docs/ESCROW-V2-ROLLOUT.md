@@ -20,7 +20,7 @@ and the application integration belongs to [EnkiArtAI/enki](https://github.com/E
 | Optional settlement failure | An unusable canonical non-treasury ATA leaves only that leg in the buyer refund. Treasury payment and usable optional legs continue. Wrong addresses or positions fail. |
 | Author vault | Authority PDA `["author", x_user_id.to_le_bytes()]` under the existing program ID; canonical classic SPL USDC ATA. Existing ATA balances remain reachable after upgrade. |
 | AuthorClaim | Version 1; 58 bytes including discriminator; version, bump, `x_user_id: u64`, claimant public key and claimed slot. PDA `["claim", x_user_id.to_le_bytes()]`. |
-| Author claim | `claim_author_vault(x_user_id, claimant)`, signed by the current operator; transfer the whole vault balance to the claimant's canonical USDC ATA, without closing the vault or keeping a balance ledger. |
+| Author claim | `claim_author_vault(x_user_id, claimant)`, signed by the current operator and, on the first claim, the claimant wallet; transfer the whole vault balance to the claimant's canonical USDC ATA, without closing the vault or keeping a balance ledger. |
 | Claimant binding | First successful claim fixes the wallet permanently, including after operator rotation. That wallet may sweep later funds. A different wallet fails with `AlreadyClaimed`; treasury, operator, default public key and author vault itself are forbidden. |
 
 Four owner/amount positions alone would grow the 231-byte v1 Escrow to the
@@ -107,6 +107,16 @@ checklist itself. Mainnet rollout is a separate decision.
 The pending `update_config` governance fix is separate mainnet release work and
 is not changed by this Devnet v2 rollout.
 
+The zero-v1-account gate is mandatory for both Devnet and Mainnet. There is no
+`reclaim_v1` instruction in this release. Require `Config.paused = true` on chain,
+stop v1 admission and finish in-flight work, then recheck all
+program-owned Escrow accounts immediately before the upgrade, and abort if any
+v1 account remains, including settled, expired or orphaned accounts. A previous
+zero result is not sufficient if new v1 deposits can still be admitted. Use a
+finalized inventory by the Escrow discriminator as well as the 231-byte v1
+layout check so unexpected account sizes are not silently excluded. Mainnet
+requires this gate's recorded evidence and the separate release approvals.
+
 ## Application claim and payment integration
 
 - Read the four server-calculated shares into the deposit plan, preserving slot
@@ -121,6 +131,18 @@ is not changed by this Devnet v2 rollout.
   transport acknowledgement or database write is not claim completion. Bind
   every retry to the same X user ID and wallet, and recover ambiguous responses
   from chain evidence before offering another action.
+- For a first claim, mark fixed account `claimant_wallet` (index 5) as a readonly
+  signer and obtain both its signature and the current operator's signature
+  over the same transaction. This also applies to an empty vault. The generated
+  IDL cannot encode this conditional requirement; an unmodified account-meta
+  builder is insufficient for first claims. The handler rejects a missing
+  signature with `ClaimantMustSign` before writing the permanent binding.
+  Later sweeps to the same bound wallet may omit its signature. Re-pin the new
+  compiled IDL and program hash even though argument shapes and account sizes
+  remain unchanged.
+- The author vault ATA must exist before a claim. If it has never received a
+  share, create its canonical ATA with the application's fee payer before
+  submitting the first claim.
 - Use the immutable on-chain claimant when routing later author shares. A
   same-wallet sweep transfers newly arrived vault funds; it does not replace
   the binding or create a debt balance. Keep the referrer payment in the buyer's
@@ -128,6 +150,15 @@ is not changed by this Devnet v2 rollout.
 - Preserve the independent x402 direct-transfer rail and existing author ATAs.
   Do not create a custody balance ledger or silently replace this rollout with
   another payment protocol.
+
+The application now omits referrer and claimed-author legs when their wallet
+has no USDC ATA at quote time and retains those shares in the treasury leg.
+That policy is decided before the signed deposit; the unnamed slot must use
+the default owner and zero amount. The author-vault ATA is still prepared by
+the application. After deposit, if a named optional ATA becomes unusable, the
+program's existing per-leg buyer-refund fallback still applies. Do not gate an
+already-funded settlement on an off-chain ATA lookup or redirect its frozen
+terms to the treasury.
 
 ## Pending Devnet acceptance
 
